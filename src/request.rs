@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use bytes::Bytes;
+use http::{HeaderMap, Method};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyString};
 
@@ -9,30 +11,29 @@ use pyo3::types::{PyBytes, PyDict, PyString};
 /// declare a parameter annotated with `alphaapi.Request`.
 #[pyclass(frozen, module = "alphaapi._core")]
 pub struct Request {
-    #[pyo3(get)]
-    pub method: String,
-    #[pyo3(get)]
+    pub method: Method,
     pub path: String,
-    #[pyo3(get)]
     pub query_string: String,
-    #[pyo3(get)]
     pub client: Option<String>,
-    pub headers: HashMap<String, String>,
-    pub params: HashMap<String, String>,
+    pub headers: HeaderMap,
+    pub params: Vec<(String, String)>,
     pub query: HashMap<String, Vec<String>>,
-    pub raw_body: Vec<u8>,
+    /// The raw body is stored as reference-counted `Bytes` so that cloning it
+    /// (e.g. for the injected request object) never copies the payload.
+    pub raw_body: Bytes,
 }
 
 impl Request {
-    pub fn from_parts(
-        method: String,
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        method: Method,
         path: String,
         query_string: String,
         client: Option<String>,
-        headers: HashMap<String, String>,
-        params: HashMap<String, String>,
+        headers: HeaderMap,
+        params: Vec<(String, String)>,
         query: HashMap<String, Vec<String>>,
-        raw_body: Vec<u8>,
+        raw_body: Bytes,
     ) -> Self {
         Self {
             method,
@@ -49,12 +50,43 @@ impl Request {
 
 #[pymethods]
 impl Request {
-    /// All request headers, with lowercase keys.
+    #[getter]
+    fn method(&self) -> String {
+        self.method.as_str().to_string()
+    }
+
+    #[getter]
+    fn path(&self) -> String {
+        self.path.clone()
+    }
+
+    #[getter]
+    fn query_string(&self) -> String {
+        self.query_string.clone()
+    }
+
+    #[getter]
+    fn client(&self) -> Option<String> {
+        self.client.clone()
+    }
+
+    /// All request headers, with lowercase keys.  Repeated headers are joined
+    /// with `", "` to match common HTTP semantics.
     #[getter]
     fn headers<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let dict = PyDict::new(py);
-        for (key, value) in &self.headers {
-            dict.set_item(key, value)?;
+        for (name, value) in &self.headers {
+            let key = name.as_str();
+            let value = value.to_str().unwrap_or("");
+            match dict.get_item(key)? {
+                Some(existing) => {
+                    let joined = format!("{}, {}", existing.extract::<String>()?, value);
+                    dict.set_item(key, joined)?;
+                }
+                None => {
+                    dict.set_item(key, value)?;
+                }
+            }
         }
         Ok(dict)
     }
@@ -104,9 +136,10 @@ impl Request {
     /// Look up a single header by name (case-insensitive).
     #[pyo3(signature = (name, default = None))]
     fn header(&self, py: Python<'_>, name: &str, default: Option<Py<PyAny>>) -> Py<PyAny> {
-        let key = name.to_ascii_lowercase();
-        match self.headers.get(&key) {
-            Some(value) => PyString::new(py, value).into_any().unbind(),
+        match self.headers.get(name) {
+            Some(value) => PyString::new(py, value.to_str().unwrap_or(""))
+                .into_any()
+                .unbind(),
             None => default.unwrap_or_else(|| py.None()),
         }
     }

@@ -13,6 +13,7 @@ from alphaapi import (
     Alpha,
     Body,
     Header,
+    HTMLResponse,
     HTTPException,
     JSONResponse,
     PlainTextResponse,
@@ -136,6 +137,34 @@ def build_app() -> Alpha:
     @app.get("/plain-response")
     def plain_response():
         return PlainTextResponse("from response", status_code=203)
+
+    @app.get("/html")
+    def html():
+        return HTMLResponse("<h1>Hello</h1>")
+
+    @app.put("/methods")
+    def method_put():
+        return {"method": "PUT"}
+
+    @app.patch("/methods")
+    def method_patch():
+        return {"method": "PATCH"}
+
+    @app.delete("/methods")
+    def method_delete():
+        return {"method": "DELETE"}
+
+    @app.post("/methods")
+    def method_post():
+        return {"method": "POST"}
+
+    @app.api_route("/multi", methods=["GET", "POST"])
+    def multi_method():
+        return {"multi": True}
+
+    @app.get("/search")
+    def search(q: str, n: int = 0):
+        return {"q": q, "n": n}
 
     router = APIRouter(prefix="/api", tags=["api"])
 
@@ -307,6 +336,33 @@ def test_redirect_response(client):
     assert status == 307
     assert headers["location"] == "/"
     assert body == b""
+
+
+def test_html_response(client):
+    status, headers, body = client.request("GET", "/html")
+    assert status == 200
+    assert headers["content-type"].startswith("text/html")
+    assert body == b"<h1>Hello</h1>"
+
+
+@pytest.mark.parametrize("method", ["PUT", "PATCH", "DELETE", "POST"])
+def test_all_http_methods(client, method):
+    status, _, body = client.request(method, "/methods")
+    assert status == 200
+    assert json.loads(body) == {"method": method}
+
+
+def test_api_route_with_multiple_methods(client):
+    for method in ("GET", "POST"):
+        status, _, body = client.request(method, "/multi")
+        assert status == 200
+        assert json.loads(body) == {"multi": True}
+
+
+def test_query_string_encoding(client):
+    status, _, body = client.request("GET", "/search?q=hello+world%21&n=3")
+    assert status == 200
+    assert json.loads(body) == {"q": "hello world!", "n": 3}
 
 
 def test_http_exception(client):

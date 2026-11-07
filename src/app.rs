@@ -1,16 +1,18 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use http::header::{CONTENT_LENGTH, CONTENT_TYPE, SERVER};
-use http::{HeaderName, HeaderValue, Method, StatusCode};
-use http_body_util::{BodyExt, Full, Limited};
-use hyper::body::Incoming;
+use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
+use http_body_util::{BodyExt, Full};
+use hyper::body::{Body as _, Incoming};
 use hyper::service::service_fn;
 use hyper::{Request as HyperRequest, Response as HyperResponse};
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::TokioIo;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyByteArray, PyBytes, PyDict, PyList, PyString, PyTuple};
@@ -22,6 +24,12 @@ use crate::request::Request;
 use crate::response::Response;
 use crate::spec::{ParamKind, ParamSpec, RouteSpec, TypeKind};
 use crate::util::json_bytes;
+
+const NOT_FOUND_BODY: &[u8] = b"{\"detail\":\"Not Found\"}";
+const METHOD_NOT_ALLOWED_BODY: &[u8] = b"{\"detail\":\"Method Not Allowed\"}";
+const INTERNAL_ERROR_BODY: &[u8] = b"{\"detail\":\"Internal Server Error\"}";
+const PAYLOAD_TOO_LARGE_BODY: &[u8] = b"{\"detail\":\"Request body too large\"}";
+const BAD_REQUEST_BODY: &[u8] = b"{\"detail\":\"Bad Request\"}";
 
 // ---------------------------------------------------------------------------
 // Python asyncio bridge
@@ -275,6 +283,9 @@ impl AppCore {
                     status_code: route.spec.status_code,
                     needs_request: route.spec.needs_request,
                     has_body: route.spec.has_body,
+                    has_header_params: route.spec.has_header_params,
+                    has_query_params: route.spec.has_query_params,
+                    has_path_params: route.spec.has_path_params,
                 },
             })
             .collect();
@@ -300,10 +311,15 @@ impl AppCore {
             event_loop: event_loop.clone(),
         });
 
+        // Python execution is serialized by the GIL, so extra Tokio workers
+        // mostly add context switching and lock contention.  Half the cores
+        // (minimum one) keeps networking responsive without that overhead;
+        // callers can raise `workers=` when sync handlers block on I/O.
         let worker_threads = workers.unwrap_or_else(|| {
             std::thread::available_parallelism()
-                .map(|count| count.get())
-                .unwrap_or(4)
+                .map(|count| count.get().saturating_add(1) / 2)
+                .unwrap_or(1)
+                .max(1)
         });
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -351,23 +367,29 @@ async fn serve(
                     Ok(value) => value,
                     Err(_) => continue,
                 };
+                // Latency matters more than packet efficiency for API traffic.
+                let _ = stream.set_nodelay(true);
                 let io = TokioIo::new(stream);
                 let state = state.clone();
-                let client = peer.ip().to_string();
+                let client = peer.ip();
 
                 tokio::spawn(async move {
                     let service = service_fn(move |request: HyperRequest<Incoming>| {
                         let state = state.clone();
-                        let client = client.clone();
                         async move {
                             Ok::<_, std::convert::Infallible>(
                                 handle_request(request, state, client).await,
                             )
                         }
                     });
-                    let builder =
-                        hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
-                    let _ = builder.serve_connection(io, service).await;
+                    // HTTP/1 is the overwhelming majority of API traffic and
+                    // avoids the protocol-detection overhead of the auto
+                    // (HTTP/1 + HTTP/2) builder.
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .keep_alive(true)
+                        .pipeline_flush(true)
+                        .serve_connection(io, service)
+                        .await;
                 });
             }
         }
@@ -379,37 +401,28 @@ async fn serve(
 async fn handle_request(
     request: HyperRequest<Incoming>,
     state: Arc<ServerState>,
-    client: String,
+    client: IpAddr,
 ) -> HyperResponse<Full<Bytes>> {
     let started = Instant::now();
-    let method = request.method().clone();
-    let path = request.uri().path().to_string();
-    let query_string = request.uri().query().unwrap_or("").to_string();
-    let headers = collect_headers(request.headers());
+    let (parts, incoming) = request.into_parts();
+    let method = parts.method;
+    let path = parts.uri.path();
+    let query = parts.uri.query().unwrap_or("");
+    let log_path = if state.access_log {
+        Some(path.to_string())
+    } else {
+        None
+    };
 
-    let body = match Limited::new(request.into_body(), state.max_body_size)
-        .collect()
-        .await
-    {
-        Ok(collected) => collected.to_bytes(),
+    // Route first, so we know exactly which request data the handler needs.
+    let matched = match state.router.at(path) {
+        Ok(matched) => matched,
         Err(_) => {
-            return BuiltResponse::error(StatusCode::PAYLOAD_TOO_LARGE, "Request body too large")
+            return BuiltResponse::static_json(StatusCode::NOT_FOUND, NOT_FOUND_BODY)
                 .into_hyper(false)
         }
     };
-
-    let (path_id, path_params) = match state.router.at(&path) {
-        Ok(matched) => {
-            let mut params = HashMap::new();
-            for (key, value) in matched.params.iter() {
-                params.insert(key.to_string(), value.to_string());
-            }
-            (*matched.value, params)
-        }
-        Err(_) => {
-            return BuiltResponse::error(StatusCode::NOT_FOUND, "Not Found").into_hyper(false)
-        }
-    };
+    let path_id = *matched.value;
 
     let methods = &state.paths[path_id];
 
@@ -429,26 +442,73 @@ async fn handle_request(
         None => return method_not_allowed(methods),
     };
 
-    let query = parse_query(&query_string);
+    let spec = &state.routes[route_index].spec;
+    let has_handlers = !state.exception_handlers.is_empty();
+    // A request object is needed if the handler declares one, or if a custom
+    // exception handler might need to inspect it.
+    let full_request = spec.needs_request || has_handlers;
+    let needs_headers = full_request || spec.has_header_params;
+    let needs_query = full_request || spec.has_query_params;
+
+    let params = if (spec.has_path_params || full_request) && !matched.params.is_empty() {
+        let mut params = Vec::with_capacity(matched.params.len());
+        for (key, value) in matched.params.iter() {
+            params.push((key.to_string(), value.to_string()));
+        }
+        params
+    } else {
+        Vec::new()
+    };
+
+    // Only materialize the pieces the route actually asked for.
+    let path_string = full_request.then(|| path.to_string());
+    let query_string = full_request.then(|| query.to_string());
+    let query_map = needs_query.then(|| parse_query(query));
+    let headers = if needs_headers {
+        Some(parts.headers)
+    } else {
+        None
+    };
+
+    let body = if incoming.is_end_stream() {
+        Bytes::new()
+    } else {
+        match read_body(incoming, state.max_body_size).await {
+            Ok(body) => body,
+            Err(BodyError::TooLarge) => {
+                return BuiltResponse::static_json(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    PAYLOAD_TOO_LARGE_BODY,
+                )
+                .into_hyper(false)
+            }
+            Err(BodyError::Read) => {
+                return BuiltResponse::static_json(StatusCode::BAD_REQUEST, BAD_REQUEST_BODY)
+                    .into_hyper(false)
+            }
+        }
+    };
+
     let request_data = RequestData {
-        method: method.as_str().to_string(),
-        path: path.clone(),
+        method: method.clone(),
+        path: path_string,
         query_string,
-        client: Some(client),
+        client: full_request.then(|| client.to_string()),
         headers,
-        params: path_params,
-        query,
+        params,
+        query: query_map,
         body,
     };
 
+    let is_head = method == Method::HEAD;
     let built = dispatch(state.clone(), route_index, request_data).await;
     let status = built.status;
-    let response = built.into_hyper(method == Method::HEAD);
+    let response = built.into_hyper(is_head);
     if state.access_log {
         eprintln!(
             "{} {} {} {:.2}ms",
             method,
-            path,
+            log_path.as_deref().unwrap_or(""),
             status.as_u16(),
             started.elapsed().as_secs_f64() * 1000.0
         );
@@ -456,9 +516,48 @@ async fn handle_request(
     response
 }
 
+enum BodyError {
+    TooLarge,
+    Read,
+}
+
+/// Collect a request body with a size limit.
+///
+/// The common case (one data frame) is returned without copying: the frame's
+/// `Bytes` buffer is used directly.  Multiple frames are merged exactly once.
+async fn read_body(mut body: Incoming, max_size: usize) -> Result<Bytes, BodyError> {
+    let mut buffer: Option<Bytes> = None;
+    let mut total = 0usize;
+
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|_| BodyError::Read)?;
+        let data = match frame.into_data() {
+            Ok(data) => data,
+            Err(_) => continue,
+        };
+
+        total = total.saturating_add(data.len());
+        if total > max_size {
+            return Err(BodyError::TooLarge);
+        }
+
+        buffer = Some(match buffer {
+            None => data,
+            Some(existing) => {
+                let mut merged = BytesMut::with_capacity(total);
+                merged.extend_from_slice(&existing);
+                merged.extend_from_slice(&data);
+                merged.freeze()
+            }
+        });
+    }
+
+    Ok(buffer.unwrap_or_default())
+}
+
 fn method_not_allowed(methods: &HashMap<Method, usize>) -> HyperResponse<Full<Bytes>> {
     let allow = allow_header(methods);
-    BuiltResponse::error(StatusCode::METHOD_NOT_ALLOWED, "Method Not Allowed")
+    BuiltResponse::static_json(StatusCode::METHOD_NOT_ALLOWED, METHOD_NOT_ALLOWED_BODY)
         .with_header("allow", allow)
         .into_hyper(false)
 }
@@ -475,32 +574,13 @@ fn allow_header(methods: &HashMap<Method, usize>) -> String {
     names.join(", ")
 }
 
-fn collect_headers(headers: &http::HeaderMap) -> HashMap<String, String> {
-    let mut result = HashMap::with_capacity(headers.len());
-    for (name, value) in headers.iter() {
-        let key = name.as_str().to_ascii_lowercase();
-        let value = value.to_str().unwrap_or("").to_string();
-        match result.entry(key) {
-            std::collections::hash_map::Entry::Occupied(mut entry) => {
-                let existing: &mut String = entry.get_mut();
-                if !existing.is_empty() {
-                    existing.push_str(", ");
-                }
-                existing.push_str(&value);
-            }
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(value);
-            }
-        }
-    }
-    result
-}
-
 fn parse_query(query: &str) -> HashMap<String, Vec<String>> {
-    let mut result: HashMap<String, Vec<String>> = HashMap::new();
     if query.is_empty() {
-        return result;
+        return HashMap::new();
     }
+
+    let pairs = query.bytes().filter(|byte| *byte == b'&').count() + 1;
+    let mut result: HashMap<String, Vec<String>> = HashMap::with_capacity(pairs);
     for (key, value) in form_urlencoded::parse(query.as_bytes()) {
         result
             .entry(key.into_owned())
@@ -514,29 +594,28 @@ fn parse_query(query: &str) -> HashMap<String, Vec<String>> {
 // Dispatch
 // ---------------------------------------------------------------------------
 
-#[derive(Clone)]
 struct RequestData {
-    method: String,
-    path: String,
-    query_string: String,
+    method: Method,
+    path: Option<String>,
+    query_string: Option<String>,
     client: Option<String>,
-    headers: HashMap<String, String>,
-    params: HashMap<String, String>,
-    query: HashMap<String, Vec<String>>,
+    headers: Option<HeaderMap>,
+    params: Vec<(String, String)>,
+    query: Option<HashMap<String, Vec<String>>>,
     body: Bytes,
 }
 
 impl RequestData {
     fn to_request(&self) -> Request {
-        Request::from_parts(
+        Request::new(
             self.method.clone(),
-            self.path.clone(),
-            self.query_string.clone(),
+            self.path.clone().unwrap_or_default(),
+            self.query_string.clone().unwrap_or_default(),
             self.client.clone(),
-            self.headers.clone(),
+            self.headers.clone().unwrap_or_default(),
             self.params.clone(),
-            self.query.clone(),
-            self.body.to_vec(),
+            self.query.clone().unwrap_or_default(),
+            self.body.clone(),
         )
     }
 }
@@ -605,13 +684,10 @@ async fn dispatch(
     if state.routes[route_index].spec.is_async {
         dispatch_async(state, route_index, request).await
     } else {
-        tokio::task::spawn_blocking(move || {
-            Python::attach(|py| dispatch_blocking(py, &state, route_index, &request))
-        })
-        .await
-        .unwrap_or_else(|_| {
-            BuiltResponse::error(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error")
-        })
+        // Run short synchronous handlers directly on the current worker.  The
+        // GIL serializes Python execution anyway, so a thread-pool round-trip
+        // only adds latency.
+        Python::attach(|py| dispatch_blocking(py, &state, route_index, &request))
     }
 }
 
@@ -634,34 +710,23 @@ async fn dispatch_async(
     route_index: usize,
     request: RequestData,
 ) -> BuiltResponse {
-    let awaitable = {
-        let call_state = state.clone();
-        let call_request = request.clone();
-        match tokio::task::spawn_blocking(move || {
-            Python::attach(|py| call_handler(py, &call_state.routes[route_index], &call_request))
-        })
-        .await
-        {
-            Ok(Ok(awaitable)) => awaitable,
-            Ok(Err(CallError::Validation(failure))) => return validation_response(failure),
-            Ok(Err(CallError::Python(error))) => {
+    // Calling an `async def` handler only creates a coroutine, so it is cheap
+    // enough to do inline instead of paying for a blocking-pool round-trip.
+    let awaitable =
+        match Python::attach(|py| call_handler(py, &state.routes[route_index], &request)) {
+            Ok(awaitable) => awaitable,
+            Err(CallError::Validation(failure)) => return validation_response(failure),
+            Err(CallError::Python(error)) => {
                 return Python::attach(|py| handle_python_error(py, &state, error, &request))
             }
-            Err(_) => {
-                return BuiltResponse::error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Internal Server Error",
-                )
-            }
-        }
-    };
+        };
 
     let event_loop = match &state.event_loop {
         Some(event_loop) => event_loop.clone(),
         None => {
-            return BuiltResponse::error(
+            return BuiltResponse::static_json(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "No asyncio event loop is available",
+                INTERNAL_ERROR_BODY,
             )
         }
     };
@@ -709,18 +774,35 @@ fn call_handler(
             ParamKind::Path => {
                 let raw = request
                     .params
-                    .get(&param.alias)
+                    .iter()
+                    .find(|(key, _)| key == &param.alias)
+                    .map(|(_, value)| value.as_str())
                     .ok_or_else(|| CallError::Validation(ValidationFailure::missing(param)))?;
                 convert_scalar(py, param, raw)?
             }
-            ParamKind::Header => {
-                let key = param.alias.to_ascii_lowercase();
-                match request.headers.get(&key) {
-                    Some(raw) => convert_scalar(py, param, raw)?,
-                    None => missing_value(py, param)?,
+            ParamKind::Header => match request
+                .headers
+                .as_ref()
+                .and_then(|headers| headers.get(param.alias.as_str()))
+            {
+                Some(raw) => {
+                    let raw = raw.to_str().map_err(|_| {
+                        CallError::Validation(ValidationFailure::new(
+                            "header",
+                            &param.alias,
+                            "Header value is not valid UTF-8",
+                            "value_error",
+                        ))
+                    })?;
+                    convert_scalar(py, param, raw)?
                 }
-            }
-            ParamKind::Query => match request.query.get(&param.alias) {
+                None => missing_value(py, param)?,
+            },
+            ParamKind::Query => match request
+                .query
+                .as_ref()
+                .and_then(|query| query.get(&param.alias))
+            {
                 Some(values) if !values.is_empty() => {
                     if param.ty == TypeKind::StrList {
                         PyList::new(py, values.iter().map(|value| value.as_str()))
@@ -740,27 +822,34 @@ fn call_handler(
                     } else {
                         PyBytes::new(py, &request.body).into_any().unbind()
                     }
-                } else {
-                    if body_parsed.is_none() {
-                        if request.body.is_empty() {
-                            body_parsed = Some(py.None().into_bound(py));
-                        } else {
-                            let value: serde_json::Value = serde_json::from_slice(&request.body)
-                                .map_err(|error| {
-                                    CallError::Validation(ValidationFailure::new(
-                                        "body",
-                                        &param.alias,
-                                        format!("Invalid JSON: {error}"),
-                                        "json_invalid",
-                                    ))
-                                })?;
-                            body_parsed = Some(
-                                pythonize::pythonize(py, &value)
-                                    .map_err(|error| CallError::Python(error.into()))?,
-                            );
-                        }
+                } else if body_parsed.is_none() {
+                    if request.body.is_empty() {
+                        body_parsed = Some(py.None().into_bound(py));
+                    } else {
+                        let value: serde_json::Value = serde_json::from_slice(&request.body)
+                            .map_err(|error| {
+                                CallError::Validation(ValidationFailure::new(
+                                    "body",
+                                    &param.alias,
+                                    format!("Invalid JSON: {error}"),
+                                    "json_invalid",
+                                ))
+                            })?;
+                        body_parsed = Some(
+                            pythonize::pythonize(py, &value)
+                                .map_err(|error| CallError::Python(error.into()))?,
+                        );
                     }
 
+                    let parsed = body_parsed.as_ref().unwrap();
+                    if parsed.is_none() {
+                        missing_value(py, param)?
+                    } else if param.ty == TypeKind::Model {
+                        construct_model(py, param, parsed)?
+                    } else {
+                        parsed.clone().unbind()
+                    }
+                } else {
                     let parsed = body_parsed.as_ref().unwrap();
                     if parsed.is_none() {
                         missing_value(py, param)?
@@ -893,7 +982,7 @@ fn validation_response(failure: ValidationFailure) -> BuiltResponse {
             "type": failure.kind,
         }]
     });
-    BuiltResponse::json(
+    BuiltResponse::json_vec(
         StatusCode::UNPROCESSABLE_ENTITY,
         serde_json::to_vec(&detail).unwrap_or_else(|_| b"{\"detail\":[]}".to_vec()),
         Vec::new(),
@@ -938,7 +1027,7 @@ fn handle_python_error(
                 }
             }
 
-            return BuiltResponse::json(
+            return BuiltResponse::json_vec(
                 StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
                 body,
                 headers,
@@ -968,7 +1057,7 @@ fn handle_python_error(
     }
 
     error.print(py);
-    BuiltResponse::error(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error")
+    BuiltResponse::static_json(StatusCode::INTERNAL_SERVER_ERROR, INTERNAL_ERROR_BODY)
 }
 
 fn serialize_result(py: Python<'_>, value: Py<PyAny>, default_status: u16) -> BuiltResponse {
@@ -980,15 +1069,15 @@ fn serialize_result(py: Python<'_>, value: Py<PyAny>, default_status: u16) -> Bu
         return BuiltResponse {
             status,
             headers: response.headers,
-            body: response.body,
-            media_type: response.media_type,
+            body: Bytes::from(response.body),
+            media_type: response.media_type.map(Cow::Owned),
         };
     }
 
     if value.is_none() {
         return BuiltResponse::json(
             StatusCode::from_u16(default_status).unwrap_or(StatusCode::OK),
-            b"null".to_vec(),
+            Bytes::from_static(b"null"),
             Vec::new(),
         );
     }
@@ -997,8 +1086,8 @@ fn serialize_result(py: Python<'_>, value: Py<PyAny>, default_status: u16) -> Bu
         return BuiltResponse {
             status: StatusCode::from_u16(default_status).unwrap_or(StatusCode::OK),
             headers: Vec::new(),
-            body: bytes.as_bytes().to_vec(),
-            media_type: Some("application/octet-stream".to_string()),
+            body: Bytes::copy_from_slice(bytes.as_bytes()),
+            media_type: Some(Cow::Borrowed("application/octet-stream")),
         };
     }
 
@@ -1006,8 +1095,8 @@ fn serialize_result(py: Python<'_>, value: Py<PyAny>, default_status: u16) -> Bu
         return BuiltResponse {
             status: StatusCode::from_u16(default_status).unwrap_or(StatusCode::OK),
             headers: Vec::new(),
-            body: bytes.to_vec(),
-            media_type: Some("application/octet-stream".to_string()),
+            body: Bytes::from(bytes.to_vec()),
+            media_type: Some(Cow::Borrowed("application/octet-stream")),
         };
     }
 
@@ -1015,20 +1104,20 @@ fn serialize_result(py: Python<'_>, value: Py<PyAny>, default_status: u16) -> Bu
         return BuiltResponse {
             status: StatusCode::from_u16(default_status).unwrap_or(StatusCode::OK),
             headers: Vec::new(),
-            body: text.to_string_lossy().into_owned().into_bytes(),
-            media_type: Some("text/plain; charset=utf-8".to_string()),
+            body: Bytes::from(text.to_string_lossy().into_owned().into_bytes()),
+            media_type: Some(Cow::Borrowed("text/plain; charset=utf-8")),
         };
     }
 
     match json_bytes(py, value) {
-        Ok(body) => BuiltResponse::json(
+        Ok(body) => BuiltResponse::json_vec(
             StatusCode::from_u16(default_status).unwrap_or(StatusCode::OK),
             body,
             Vec::new(),
         ),
         Err(error) => {
             error.print(py);
-            BuiltResponse::error(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error")
+            BuiltResponse::static_json(StatusCode::INTERNAL_SERVER_ERROR, INTERNAL_ERROR_BODY)
         }
     }
 }
@@ -1040,36 +1129,35 @@ fn serialize_result(py: Python<'_>, value: Py<PyAny>, default_status: u16) -> Bu
 struct BuiltResponse {
     status: StatusCode,
     headers: Vec<(String, String)>,
-    body: Vec<u8>,
-    media_type: Option<String>,
+    body: Bytes,
+    media_type: Option<Cow<'static, str>>,
 }
 
 impl BuiltResponse {
-    fn json(status: StatusCode, body: Vec<u8>, headers: Vec<(String, String)>) -> Self {
+    fn json(status: StatusCode, body: Bytes, headers: Vec<(String, String)>) -> Self {
         Self {
             status,
             headers,
             body,
-            media_type: Some("application/json".to_string()),
+            media_type: Some(Cow::Borrowed("application/json")),
         }
+    }
+
+    fn json_vec(status: StatusCode, body: Vec<u8>, headers: Vec<(String, String)>) -> Self {
+        Self::json(status, Bytes::from(body), headers)
+    }
+
+    fn static_json(status: StatusCode, body: &'static [u8]) -> Self {
+        Self::json(status, Bytes::from_static(body), Vec::new())
     }
 
     fn empty(status: StatusCode, headers: Vec<(String, String)>) -> Self {
         Self {
             status,
             headers,
-            body: Vec::new(),
+            body: Bytes::new(),
             media_type: None,
         }
-    }
-
-    fn error(status: StatusCode, message: &str) -> Self {
-        Self::json(
-            status,
-            serde_json::to_vec(&serde_json::json!({ "detail": message }))
-                .unwrap_or_else(|_| b"{\"detail\":\"error\"}".to_vec()),
-            Vec::new(),
-        )
     }
 
     fn with_header(mut self, key: &str, value: String) -> Self {
@@ -1084,7 +1172,7 @@ impl BuiltResponse {
         let body = if head || no_body {
             Bytes::new()
         } else {
-            Bytes::from(self.body)
+            self.body
         };
 
         let mut response = HyperResponse::new(Full::new(body));
@@ -1102,14 +1190,15 @@ impl BuiltResponse {
 
         if !headers.contains_key(CONTENT_TYPE) {
             if let Some(media_type) = &self.media_type {
-                if let Ok(value) = HeaderValue::from_str(media_type) {
+                if let Ok(value) = HeaderValue::from_str(media_type.as_ref()) {
                     headers.insert(CONTENT_TYPE, value);
                 }
             }
         }
 
         if !headers.contains_key(CONTENT_LENGTH) && !no_body {
-            if let Ok(value) = HeaderValue::from_str(&length.to_string()) {
+            let mut buffer = itoa::Buffer::new();
+            if let Ok(value) = HeaderValue::from_str(buffer.format(length)) {
                 headers.insert(CONTENT_LENGTH, value);
             }
         }

@@ -39,6 +39,9 @@ pub struct RouteSpec {
     pub status_code: u16,
     pub needs_request: bool,
     pub has_body: bool,
+    pub has_header_params: bool,
+    pub has_query_params: bool,
+    pub has_path_params: bool,
 }
 
 fn opt_str<'py>(dict: &Bound<'py, PyDict>, key: &str) -> PyResult<Option<String>> {
@@ -109,7 +112,12 @@ impl RouteSpec {
             let ty = parse_type(&req_str(dict, "type", "parameter type")?)?;
             let required = req_bool(dict, "required", false)?;
             let positional = req_bool(dict, "positional", true)?;
-            let alias = opt_str(dict, "alias")?.unwrap_or_else(|| name.clone());
+            let mut alias = opt_str(dict, "alias")?.unwrap_or_else(|| name.clone());
+            if kind == ParamKind::Header {
+                // Header lookups in `HeaderMap` use lowercase names.  Doing this
+                // once here avoids allocating on every request.
+                alias = alias.to_ascii_lowercase();
+            }
 
             let default = match dict.get_item("default")? {
                 Some(value) if !required => Some(value.unbind()),
@@ -139,6 +147,9 @@ impl RouteSpec {
         };
         let needs_request = params.iter().any(|p| p.kind == ParamKind::Request);
         let has_body = params.iter().any(|p| p.kind == ParamKind::Body);
+        let has_header_params = params.iter().any(|p| p.kind == ParamKind::Header);
+        let has_query_params = params.iter().any(|p| p.kind == ParamKind::Query);
+        let has_path_params = params.iter().any(|p| p.kind == ParamKind::Path);
 
         let _ = py;
         Ok(RouteSpec {
@@ -147,6 +158,9 @@ impl RouteSpec {
             status_code,
             needs_request,
             has_body,
+            has_header_params,
+            has_query_params,
+            has_path_params,
         })
     }
 }
