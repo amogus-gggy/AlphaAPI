@@ -1,0 +1,44 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "alphaapi"
+version = "0.1.0"
+description = "A fast, FastAPI-inspired Python web framework with a Rust core"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "AlphaAPI contributors" }]
+keywords = ["web", "framework", "http", "rust", "fastapi", "asyncio"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Framework :: AsyncIO",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Topic :: Internet :: WWW/HTTP :: HTTP Servers",
+    "Typing :: Typed",
+]
+dependencies = []
+
+[project.optional-dependencies]
+pydantic = ["pydantic>=2"]
+dev = [
+    "pytest>=8",
+    "pydantic>=2",
+    "fastapi>=0.110",
+    "uvicorn>=0.30",
+]
+
+[project.scripts]
+alphaapi = "alphaapi.cli:main"
+
+[tool.maturin]
+python-source = "python"
+module-name = "alphaapi._core"
+strip = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
