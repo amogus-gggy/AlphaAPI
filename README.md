@@ -48,6 +48,79 @@ alphaapi run main:app --port 8000
 
 Open <http://127.0.0.1:8000/docs> for the generated Swagger UI.
 
+## FastAPI compatibility mode (experimental)
+
+> **Warning:** this is a **backward-compatibility mod**. It monkeypatches the
+> `fastapi` module so existing code can run on AlphaAPI. It **can degrade
+> performance**, **may not be optimal**, and does not implement every
+> FastAPI/Starlette feature or edge case. Unsupported features may be ignored,
+> partially emulated, or raise an error. Prefer the native `alphaapi` API for
+> production workloads.
+
+```python
+import alphaapi.compat.fastapi as compat
+
+compat.install()  # emits a CompatibilityWarning
+
+# Existing FastAPI-style code now works:
+from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi.responses import JSONResponse
+
+app = FastAPI(title="Compat Demo")
+
+
+def get_token() -> str:
+    return "demo-token"
+
+
+@app.get("/items/{item_id}")
+def read_item(item_id: int, q: str | None = Query(default=None), token: str = Depends(get_token)):
+    return {"item_id": item_id, "q": q, "token": token}
+
+
+if __name__ == "__main__":
+    app.run(port=8000)  # AlphaAPI's Rust server
+```
+
+Existing `uvicorn module:app` deployments also work: the compat app lazily
+starts AlphaAPI's Rust server and proxies ASGI requests to it. That proxy hop is
+one of the reasons compatibility mode is slower than native AlphaAPI.
+
+Install it before importing application modules (or at least before creating
+the `FastAPI` app):
+
+```python
+import alphaapi.compat.fastapi as compat
+
+compat.install()  # warnings.warn(..., CompatibilityWarning)
+```
+
+Pass `warn=False` to silence the warning (not recommended).
+
+**What works reasonably well**
+
+- `FastAPI`/`APIRouter`, route decorators, prefixes, tags, `include_router`
+- Path/query/header/body parameters, aliases, defaults, Pydantic validation
+  (delegated to AlphaAPI's Rust core where possible)
+- `Depends`/`Security` with simple (sync or async) dependencies
+- `Cookie` parameters (parsed in Python), `Request` adapter, `BackgroundTasks`
+  container (tasks are not auto-executed)
+- `HTTPException`, custom exception handlers, `status`
+- JSON/plain-text/HTML/redirect responses, response classes, OpenAPI/docs
+- `uvicorn module:app` via a local ASGI-to-Rust proxy
+- A minimal `TestClient`, `jsonable_encoder`, common security marker classes,
+  middleware/static/templating placeholders that warn when used
+
+**Known limitations**
+
+- `response_model` is accepted but not used for validation/serialization
+- Form/file uploads, WebSockets, middleware execution, static mounts, lifespan
+  composition, background task execution and response streaming are incomplete
+- Compatibility routes that need Python-side binding (dependencies, cookies,
+  forms, `Request`) bypass AlphaAPI's fast Rust binding and are slower
+- Semantics may differ subtly from FastAPI/Starlette
+
+
 ## Features
 
 - Rust-powered HTTP/1.1 server built on `hyper` and `tokio`

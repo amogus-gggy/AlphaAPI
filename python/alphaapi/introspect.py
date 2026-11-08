@@ -74,6 +74,54 @@ def _safe_hints(func: Callable[..., Any]) -> dict[str, Any]:
         return dict(getattr(func, "__annotations__", {}))
 
 
+def _as_compat_param(obj: Any) -> Param | None:
+    """Recognize AlphaAPI and FastAPI-compatible parameter markers.
+
+    This accepts native ``alphaapi.params.Param`` instances and duck-typed
+    FastAPI/compat markers (``fastapi.params.*``) so monkeypatched FastAPI code
+    can bind through AlphaAPI's Rust core. Unknown marker shapes are ignored.
+    """
+    if isinstance(obj, Param):
+        return obj
+    # FastAPI/compat markers usually expose ``in_`` / class names like Query.
+    cls = obj.__class__
+    mod = getattr(cls, "__module__", "") or ""
+    name = getattr(cls, "__name__", "")
+    if not (mod.startswith("fastapi.") or mod.startswith("alphaapi.compat")):
+        # Also accept duck-typed markers.
+        if not hasattr(obj, "default") or not (name in {"Query", "Path", "Header", "Cookie", "Body", "Form", "File"}):
+            return None
+    kind_map = {
+        "Query": Query,
+        "Path": Path,
+        "Header": Header,
+        "Body": Body,
+        "Form": Body,   # compat fallback
+        "File": Body,   # compat fallback
+        "Cookie": Header,  # compat fallback; cookie name passed as alias
+    }
+    maker = kind_map.get(name)
+    if maker is None:
+        return None
+    default = getattr(obj, "default", MISSING)
+    # FastAPI uses PydanticUndefined / Ellipsis / Undefined in places.
+    if default is Ellipsis or getattr(default, "__class__", type(None)).__name__ == "PydanticUndefinedType":
+        default = MISSING
+    # fastapi.params use default_factory / other sentinels; treat placeholder-ish values as missing.
+    if getattr(default, "__class__", type(None)).__name__ == "DefaultPlaceholder":
+        default = MISSING
+    alias = getattr(obj, "alias", None)
+    if getattr(alias, "__class__", type(None)).__name__ == "DefaultPlaceholder":
+        alias = None
+    description = getattr(obj, "description", None)
+    if getattr(description, "__class__", type(None)).__name__ == "DefaultPlaceholder":
+        description = None
+    if name == "Cookie" and not alias:
+        # handled in _default_alias path via kind/header fallback? keep name.
+        alias = getattr(obj, "alias", None)
+    return maker(default, alias=alias, description=description)
+
+
 def _split_annotation(annotation: Any) -> tuple[Any, Param | None]:
     """Peel ``Annotated[...]``, ``Optional[...]`` and ``X | None`` wrappers."""
     marker: Param | None = None
@@ -86,8 +134,9 @@ def _split_annotation(annotation: Any) -> tuple[Any, Param | None]:
             args = get_args(annotation)
             annotation = args[0]
             for extra in args[1:]:
-                if isinstance(extra, Param):
-                    marker = extra
+                compat = _as_compat_param(extra)
+                if compat is not None:
+                    marker = compat
             continue
 
         if origin in (typing.Union, types.UnionType):
@@ -196,9 +245,13 @@ def build_spec(endpoint: Callable[..., Any], path: str, status_code: int) -> Spe
         annotation, marker = _split_annotation(annotation)
 
         default = parameter.default
+        compat_default = _as_compat_param(default)
         if isinstance(default, Param):
             marker = default
             default = default.default
+        elif compat_default is not None:
+            marker = compat_default
+            default = compat_default.default
         elif default is inspect.Parameter.empty:
             default = MISSING
 
