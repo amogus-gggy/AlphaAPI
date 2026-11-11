@@ -83,6 +83,10 @@ mysite/
     └── views.py
 ```
 
+The generated home page is a Django-style welcome screen showing the AlphaAPI
+version, the project name, and suggested next steps. Edit `mysite/views.py` to
+replace it.
+
 `startapp` creates a reusable package with `apps.py`, `urls.py`, `views.py`
 and an empty `__init__.py`. Add its config to `INSTALLED_APPS` and include its
 URLconf:

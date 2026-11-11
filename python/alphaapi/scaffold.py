@@ -86,14 +86,15 @@ urlpatterns = [
 ]
 '''
 
-PROJECT_VIEWS = '''"""Views for the {name} project."""
+PROJECT_VIEWS = '''"""Views for the __PROJECT_NAME__ project."""
 from __future__ import annotations
 
-from alphaapi import HttpResponse, JsonResponse
+from alphaapi import HttpResponse
+from alphaapi.welcome import welcome_page
 
 
 async def index(request):
-    return JsonResponse({{"message": "Hello from {name}"}})
+    return HttpResponse(welcome_page("__PROJECT_NAME__"))
 
 
 async def health(request):
@@ -157,7 +158,7 @@ def startproject(name: str, directory: str | Path | None = None) -> Path:
         ),
     )
     _write(package / "urls.py", PROJECT_URLS.format(name=name))
-    _write(package / "views.py", PROJECT_VIEWS.format(name=name))
+    _write(package / "views.py", PROJECT_VIEWS.replace("__PROJECT_NAME__", name))
     return destination
 
 

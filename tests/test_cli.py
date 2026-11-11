@@ -26,10 +26,16 @@ def test_cli_startproject_and_startapp(tmp_path):
             sys.executable,
             "-c",
             (
-                "import demo.app as demo, blog.apps as blog; "
+                "import asyncio; "
+                "import demo.app as demo; "
+                "import demo.views as views; "
+                "import blog.apps as blog; "
                 "demo.app._ensure_resolved(); "
                 "print(demo.app.reverse('index')); "
-                "print(blog.BlogConfig().name)"
+                "print(blog.BlogConfig().name); "
+                "page = asyncio.run(views.index(None)); "
+                "print(page.status_code); "
+                "print(page.body.decode())"
             ),
         ],
         cwd=target,
@@ -37,7 +43,12 @@ def test_cli_startproject_and_startapp(tmp_path):
         text=True,
     )
     assert result.returncode == 0, result.stderr
-    assert result.stdout.splitlines() == ["/", "blog"]
+    lines = result.stdout.splitlines()
+    assert lines[:3] == ["/", "blog", "200"]
+    page = "\n".join(lines[3:])
+    assert "The install worked successfully! Congratulations!" in page
+    assert "AlphaAPI" in page
+    assert "demo" in page
 
 
 def test_startproject_rejects_non_empty_destination(tmp_path):

@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 from alphaapi import HttpResponse, JsonResponse, View
+from alphaapi.welcome import welcome_page
 
 
 async def index(request):
-    return JsonResponse({"message": "Hello from the example project"})
+    return HttpResponse(welcome_page("project"))
 
 
 async def item(request, item_id: int):
