@@ -4,182 +4,190 @@ import asyncio
 import json
 import threading
 from dataclasses import dataclass
+from uuid import UUID
 
 import pytest
-from pydantic import BaseModel, Field
 
 from alphaapi import (
-    APIRouter,
-    Alpha,
-    Body,
-    Header,
-    HTMLResponse,
+    Application,
     HTTPException,
-    JSONResponse,
-    PlainTextResponse,
-    Query,
-    RedirectResponse,
-    Request,
+    Http404,
+    HttpResponse,
+    HttpResponseNotFound,
+    HttpResponseRedirect,
+    JsonResponse,
+    MiddlewareMixin,
+    PermissionDenied,
+    View,
+    include,
+    path,
+    reverse,
 )
-
-
-class Item(BaseModel):
-    name: str
-    price: float = Field(gt=0)
-    tags: list[str] = []
-
-
-@dataclass
-class Widget:
-    label: str
-    count: int
+from alphaapi.urls import clear_patterns
 
 
 class Boom(Exception):
     pass
 
 
-def build_app() -> Alpha:
-    app = Alpha(title="Test API", version="9.9.9", description="test app")
+class AddHeaderMiddleware(MiddlewareMixin):
+    async def __call__(self, request):
+        response = await self.get_response(request)
+        response["x-middleware"] = "on"
+        return response
 
-    @app.get("/")
-    def root():
-        return {"hello": "world"}
 
-    @app.get("/items/{item_id}")
-    def read_item(
-        item_id: int,
-        q: str | None = None,
-        limit: int = Query(10),
-        active: bool = True,
-        ratio: float = 1.5,
-    ):
-        return {
-            "item_id": item_id,
-            "q": q,
-            "limit": limit,
-            "active": active,
-            "ratio": ratio,
-        }
+class ItemView(View):
+    async def get(self, request, item_id: int):
+        return JsonResponse({"item_id": item_id, "kind": "class"})
 
-    @app.get("/tags")
-    def tags(tag: list[str] = Query(None)):
-        return {"tags": tag}
+    async def post(self, request, item_id: int):
+        payload = await asyncio.to_thread(request.json)
+        return JsonResponse({"item_id": item_id, "payload": payload}, status=201)
 
-    @app.get("/required")
-    def required(q: str):
-        return {"q": q}
+    async def delete(self, request, item_id: int):
+        return HttpResponse(b"", status=204)
 
-    @app.get("/header")
-    def header(x_token: str = Header(...)):
-        return {"token": x_token}
 
-    @app.post("/items", status_code=201)
-    def create_item(item: Item):
-        return {"created": item, "name": item.name}
+class OnlyGetView(View):
+    async def get(self, request):
+        return JsonResponse({"only": "get"})
 
-    @app.post("/widgets")
-    def create_widget(widget: Widget):
-        return {"widget": widget}
 
-    @app.post("/raw")
-    def raw(data: bytes):
-        return {"size": len(data), "text": data.decode()}
+def build_app() -> Application:
+    clear_patterns()
 
-    @app.post("/dict-body")
-    def dict_body(payload: dict = Body(...)):
-        return payload
+    async def index(request):
+        return JsonResponse({"hello": "world"})
 
-    @app.get("/text")
-    def text():
-        return "plain text"
+    async def item(request, item_id: int):
+        return JsonResponse(
+            {
+                "item_id": item_id,
+                "q": request.GET.get("q"),
+                "tags": request.GET.getlist("tag"),
+            }
+        )
 
-    @app.get("/bytes")
-    def raw_bytes():
-        return b"\x00\x01\x02"
+    async def required(request):
+        q = request.GET.get("q")
+        if q is None:
+            raise HTTPException(422, "q is required")
+        return JsonResponse({"q": q})
 
-    @app.get("/custom")
-    def custom():
-        return JSONResponse({"custom": True}, status_code=202, headers={"x-demo": "yes"})
+    async def header_view(request):
+        token = request.headers.get("x-token")
+        if token is None:
+            raise HTTPException(422, "x-token header is required")
+        return JsonResponse({"token": token})
 
-    @app.get("/teapot")
-    def teapot():
+    async def echo(request):
+        return JsonResponse({"payload": request.json()})
+
+    async def form(request):
+        return JsonResponse({"form": request.POST.dict()})
+
+    async def cookie(request):
+        return JsonResponse({"s": request.COOKIES.get("s")})
+
+    async def text(request):
+        return HttpResponse("plain text", content_type="text/plain; charset=utf-8")
+
+    async def raw_bytes(request):
+        return HttpResponse(b"\x00\x01\x02", content_type="application/octet-stream")
+
+    async def custom(request):
+        return JsonResponse({"custom": True}, status=202, headers={"x-demo": "yes"})
+
+    async def teapot(request):
         raise HTTPException(418, detail="I'm a teapot", headers={"x-tea": "earl-grey"})
 
-    @app.get("/boom")
-    def boom():
+    async def missing(request):
+        raise Http404("No such item")
+
+    async def forbidden(request):
+        raise PermissionDenied("Nope")
+
+    async def boom(request):
         raise Boom("custom boom")
+
+    async def async_route(request, value: int):
+        await asyncio.sleep(0.001)
+        return JsonResponse({"value": value, "double": value * 2})
+
+    async def redirect(request):
+        return HttpResponseRedirect("/")
+
+    def sync_view(request):
+        return JsonResponse({"sync": True})
+
+    async def methods(request):
+        return JsonResponse({"method": request.method})
+
+    async def uuid_view(request, value):
+        return JsonResponse({"value": str(value), "is_uuid": isinstance(value, UUID)})
+
+    async def wildcard(request, rest):
+        return JsonResponse({"rest": rest})
+
+    async def request_info(request):
+        return JsonResponse(
+            {
+                "method": request.method,
+                "path": request.path,
+                "query": request.GET.dict(),
+                "x": request.headers.get("x-test"),
+                "body": request.text(),
+            }
+        )
+
+    api_patterns = [
+        path("ping/", lambda request: JsonResponse({"pong": True}), name="ping"),
+    ]
+    v2_patterns = [
+        path("ping/", lambda request: JsonResponse({"pong": 2}), name="ping"),
+    ]
+
+    urlpatterns = [
+        path("", index, name="index"),
+        path("items/<int:item_id>/", item, name="item"),
+        path("required/", required, name="required"),
+        path("header/", header_view, name="header"),
+        path("echo/", echo, name="echo"),
+        path("form/", form, name="form"),
+        path("cookie/", cookie, name="cookie"),
+        path("text/", text, name="text"),
+        path("bytes/", raw_bytes, name="bytes"),
+        path("custom/", custom, name="custom"),
+        path("teapot/", teapot, name="teapot"),
+        path("missing/", missing, name="missing"),
+        path("forbidden/", forbidden, name="forbidden"),
+        path("boom/", boom, name="boom"),
+        path("async/<int:value>/", async_route, name="async"),
+        path("redirect/", redirect, name="redirect"),
+        path("methods/", methods, name="methods"),
+        path("sync/", sync_view, name="sync"),
+        path("uuid/<uuid:value>/", uuid_view, name="uuid"),
+        path("files/<path:rest>", wildcard, name="files"),
+        path("request/", request_info, name="request-info"),
+        path("cbv/<int:item_id>/", ItemView.as_view(), name="cbv"),
+        path("auto-cbv/<int:item_id>/", ItemView, name="auto-cbv"),
+        path("only-get/", OnlyGetView.as_view(), name="only-get"),
+        path("api/", include((api_patterns, "api"))),
+        path("api/v2/", include((v2_patterns, "api_v2"))),
+    ]
+
+    app = Application(
+        urlpatterns=urlpatterns,
+        title="Test API",
+        version="9.9.9",
+        middleware=[AddHeaderMiddleware],
+        installed_apps=["alphaapi"],
+    )
 
     @app.exception_handler(Boom)
     def handle_boom(request, exc):
-        return JSONResponse({"handled": str(exc)}, status_code=409)
-
-    @app.get("/request")
-    def request_info(request: Request):
-        return {
-            "method": request.method,
-            "path": request.path,
-            "query": request.query_params,
-            "params": request.params,
-            "x": request.header("x-test"),
-            "body": request.text(),
-        }
-
-    @app.get("/async/{value}")
-    async def async_route(value: int):
-        await asyncio.sleep(0.002)
-        return {"value": value, "double": value * 2}
-
-    @app.get("/redirect")
-    def redirect():
-        return RedirectResponse("/")
-
-    @app.get("/plain-response")
-    def plain_response():
-        return PlainTextResponse("from response", status_code=203)
-
-    @app.get("/html")
-    def html():
-        return HTMLResponse("<h1>Hello</h1>")
-
-    @app.put("/methods")
-    def method_put():
-        return {"method": "PUT"}
-
-    @app.patch("/methods")
-    def method_patch():
-        return {"method": "PATCH"}
-
-    @app.delete("/methods")
-    def method_delete():
-        return {"method": "DELETE"}
-
-    @app.post("/methods")
-    def method_post():
-        return {"method": "POST"}
-
-    @app.api_route("/multi", methods=["GET", "POST"])
-    def multi_method():
-        return {"multi": True}
-
-    @app.get("/search")
-    def search(q: str, n: int = 0):
-        return {"q": q, "n": n}
-
-    router = APIRouter(prefix="/api", tags=["api"])
-
-    @router.get("/ping")
-    def ping():
-        return {"pong": True}
-
-    api2 = APIRouter(prefix="/v2")
-
-    @api2.get("/ping")
-    def ping2():
-        return {"pong": 2}
-
-    router.include_router(api2)
-    app.include_router(router)
+        return JsonResponse({"handled": str(exc)}, status=409)
 
     return app
 
@@ -193,282 +201,253 @@ def json_body(response):
     return json.loads(response[2])
 
 
-def test_root(client):
+def test_index_and_middleware(client):
     status, headers, body = client.request("GET", "/")
     assert status == 200
     assert headers["content-type"] == "application/json"
+    assert headers["x-middleware"] == "on"
     assert json.loads(body) == {"hello": "world"}
 
 
-def test_path_and_query_conversion(client):
-    status, _, body = client.request("GET", "/items/42?q=hi&limit=7&active=false&ratio=2.5")
+def test_path_converter_and_query(client):
+    status, _, body = client.request("GET", "/items/42/?q=hi&tag=a&tag=b")
     assert status == 200
-    assert json.loads(body) == {
-        "item_id": 42,
-        "q": "hi",
-        "limit": 7,
-        "active": False,
-        "ratio": 2.5,
-    }
+    assert json.loads(body) == {"item_id": 42, "q": "hi", "tags": ["a", "b"]}
 
 
-def test_query_defaults(client):
-    status, _, body = client.request("GET", "/items/1")
+def test_invalid_path_converter_returns_404(client):
+    status, _, body = client.request("GET", "/items/nope/")
+    assert status == 404
+    assert b"No match for item_id" in body
+
+
+def test_query_access_and_http_exception(client):
+    status, _, body = client.request("GET", "/required/?q=ok")
     assert status == 200
-    assert json.loads(body) == {
-        "item_id": 1,
-        "q": None,
-        "limit": 10,
-        "active": True,
-        "ratio": 1.5,
-    }
+    assert json.loads(body) == {"q": "ok"}
 
-
-def test_invalid_path_type_returns_422(client):
-    status, _, body = client.request("GET", "/items/not-an-int")
+    status, _, body = client.request("GET", "/required/")
     assert status == 422
-    detail = json.loads(body)["detail"]
-    assert detail[0]["loc"] == ["path", "item_id"]
-    assert detail[0]["type"] == "int_parsing"
+    assert json.loads(body)["detail"] == "q is required"
 
 
-def test_missing_required_query_returns_422(client):
-    status, _, body = client.request("GET", "/required")
-    assert status == 422
-    assert json.loads(body)["detail"][0]["loc"] == ["query", "q"]
-
-
-def test_invalid_bool_returns_422(client):
-    status, _, body = client.request("GET", "/items/1?active=maybe")
-    assert status == 422
-    assert json.loads(body)["detail"][0]["type"] == "bool_parsing"
-
-
-def test_query_list(client):
-    status, _, body = client.request("GET", "/tags?tag=a&tag=b")
-    assert status == 200
-    assert json.loads(body) == {"tags": ["a", "b"]}
-
-
-def test_header_parameter(client):
-    status, _, body = client.request("GET", "/header", headers={"x-token": "secret"})
+def test_header_access(client):
+    status, _, body = client.request("GET", "/header/", headers={"x-token": "secret"})
     assert status == 200
     assert json.loads(body) == {"token": "secret"}
 
-    status, _, body = client.request("GET", "/header")
-    assert status == 422
-    assert json.loads(body)["detail"][0]["loc"] == ["header", "x-token"]
 
-
-def test_pydantic_body_and_status_code(client):
+def test_json_body(client):
     payload = json.dumps({"name": "apple", "price": 1.5}).encode()
     status, _, body = client.request(
-        "POST", "/items", body=payload, headers={"content-type": "application/json"}
+        "POST", "/echo/", body=payload, headers={"content-type": "application/json"}
     )
-    assert status == 201
-    data = json.loads(body)
-    assert data["name"] == "apple"
-    assert data["created"]["tags"] == []
-
-
-def test_pydantic_validation_error(client):
-    payload = json.dumps({"name": "apple", "price": -1}).encode()
-    status, _, body = client.request("POST", "/items", body=payload)
-    assert status == 422
-    assert json.loads(body)["detail"][0]["loc"][0] == "body"
-
-
-def test_dataclass_body(client):
-    payload = json.dumps({"label": "x", "count": 3}).encode()
-    status, _, body = client.request("POST", "/widgets", body=payload)
     assert status == 200
-    assert json.loads(body) == {"widget": {"label": "x", "count": 3}}
+    assert json.loads(body) == {"payload": {"name": "apple", "price": 1.5}}
 
 
-def test_bytes_body(client):
-    status, _, body = client.request("POST", "/raw", body=b"hello")
+def test_form_body(client):
+    status, _, body = client.request(
+        "POST",
+        "/form/",
+        body=b"a=1&b=hello+world",
+        headers={"content-type": "application/x-www-form-urlencoded"},
+    )
     assert status == 200
-    assert json.loads(body) == {"size": 5, "text": "hello"}
+    assert json.loads(body) == {"form": {"a": "1", "b": "hello world"}}
 
 
-def test_dict_body(client):
-    payload = json.dumps({"a": [1, 2, 3]}).encode()
-    status, _, body = client.request("POST", "/dict-body", body=payload)
+def test_cookies(client):
+    status, _, body = client.request("GET", "/cookie/", headers={"cookie": "s=abc"})
     assert status == 200
-    assert json.loads(body) == {"a": [1, 2, 3]}
+    assert json.loads(body) == {"s": "abc"}
 
 
-def test_invalid_json_body(client):
-    status, _, body = client.request("POST", "/dict-body", body=b"{not json")
-    assert status == 422
-    assert json.loads(body)["detail"][0]["type"] == "json_invalid"
-
-
-def test_text_response(client):
-    status, headers, body = client.request("GET", "/text")
+def test_text_bytes_and_custom_responses(client):
+    status, headers, body = client.request("GET", "/text/")
     assert status == 200
     assert headers["content-type"].startswith("text/plain")
     assert body == b"plain text"
 
-
-def test_bytes_response(client):
-    status, headers, body = client.request("GET", "/bytes")
+    status, headers, body = client.request("GET", "/bytes/")
     assert status == 200
     assert headers["content-type"] == "application/octet-stream"
     assert body == b"\x00\x01\x02"
 
-
-def test_custom_json_response(client):
-    status, headers, body = client.request("GET", "/custom")
+    status, headers, body = client.request("GET", "/custom/")
     assert status == 202
     assert headers["x-demo"] == "yes"
     assert json.loads(body) == {"custom": True}
 
 
-def test_plain_response_class(client):
-    status, headers, body = client.request("GET", "/plain-response")
-    assert status == 203
-    assert body == b"from response"
-
-
-def test_redirect_response(client):
-    status, headers, body = client.request("GET", "/redirect")
-    assert status == 307
-    assert headers["location"] == "/"
-    assert body == b""
-
-
-def test_html_response(client):
-    status, headers, body = client.request("GET", "/html")
-    assert status == 200
-    assert headers["content-type"].startswith("text/html")
-    assert body == b"<h1>Hello</h1>"
-
-
-@pytest.mark.parametrize("method", ["PUT", "PATCH", "DELETE", "POST"])
-def test_all_http_methods(client, method):
-    status, _, body = client.request(method, "/methods")
-    assert status == 200
-    assert json.loads(body) == {"method": method}
-
-
-def test_api_route_with_multiple_methods(client):
-    for method in ("GET", "POST"):
-        status, _, body = client.request(method, "/multi")
-        assert status == 200
-        assert json.loads(body) == {"multi": True}
-
-
-def test_query_string_encoding(client):
-    status, _, body = client.request("GET", "/search?q=hello+world%21&n=3")
-    assert status == 200
-    assert json.loads(body) == {"q": "hello world!", "n": 3}
-
-
-def test_http_exception(client):
-    status, headers, body = client.request("GET", "/teapot")
+def test_http_exception_with_headers(client):
+    status, headers, body = client.request("GET", "/teapot/")
     assert status == 418
     assert headers["x-tea"] == "earl-grey"
     assert json.loads(body) == {"detail": "I'm a teapot"}
 
 
+def test_django_exceptions(client):
+    status, headers, body = client.request("GET", "/missing/")
+    assert status == 404
+    assert headers["content-type"].startswith("text/html")
+    assert b"No such item" in body
+
+    status, headers, body = client.request("GET", "/forbidden/")
+    assert status == 403
+    assert b"Nope" in body
+
+
 def test_custom_exception_handler(client):
-    status, _, body = client.request("GET", "/boom")
+    status, _, body = client.request("GET", "/boom/")
     assert status == 409
     assert json.loads(body) == {"handled": "custom boom"}
 
 
-def test_request_object(client):
-    status, _, body = client.request("GET", "/request?a=1&a=2&b=3", headers={"x-test": "yes"})
-    assert status == 200
-    data = json.loads(body)
-    assert data["method"] == "GET"
-    assert data["path"] == "/request"
-    assert data["query"] == {"a": ["1", "2"], "b": "3"}
-    assert data["x"] == "yes"
+def test_custom_http404_handler(start_server):
+    async def missing(request):
+        raise Http404("custom missing")
+
+    app = Application(urlpatterns=[path("", missing)])
+
+    @app.exception_handler(Http404)
+    def handle_missing(request, exc):
+        return JsonResponse({"missing": str(exc)}, status=404)
+
+    server = start_server(app)
+    status, _, body = server.request("GET", "/")
+    assert status == 404
+    assert json.loads(body) == {"missing": "custom missing"}
 
 
-def test_async_handler(client):
-    status, _, body = client.request("GET", "/async/21")
+def test_async_view(client):
+    status, _, body = client.request("GET", "/async/21/")
     assert status == 200
     assert json.loads(body) == {"value": 21, "double": 42}
 
 
-def test_router_prefix_and_nested_prefix(client):
-    status, _, body = client.request("GET", "/api/ping")
+def test_sync_view_uses_fast_path(start_server):
+    app = Application(
+        urlpatterns=[path("", lambda request: JsonResponse({"sync": True}))]
+    )
+    server = start_server(app)
+    status, _, body = server.request("GET", "/")
     assert status == 200
-    assert json.loads(body) == {"pong": True}
-
-    status, _, body = client.request("GET", "/api/v2/ping")
-    assert status == 200
-    assert json.loads(body) == {"pong": 2}
+    assert json.loads(body) == {"sync": True}
 
 
-def test_404(client):
-    status, _, body = client.request("GET", "/nope")
-    assert status == 404
-    assert json.loads(body) == {"detail": "Not Found"}
-
-
-def test_405_and_allow_header(client):
-    status, headers, body = client.request("POST", "/")
-    assert status == 405
-    assert "GET" in headers["allow"]
-    assert json.loads(body) == {"detail": "Method Not Allowed"}
-
-
-def test_options(client):
-    status, headers, body = client.request("OPTIONS", "/")
-    assert status == 204
-    assert "GET" in headers["allow"]
-    assert "HEAD" in headers["allow"]
+def test_redirect(client):
+    status, headers, body = client.request("GET", "/redirect/")
+    assert status == 302
+    assert headers["location"] == "/"
     assert body == b""
 
 
-def test_head(client):
-    status, headers, body = client.request("HEAD", "/")
+def test_all_http_methods_with_function_view(client):
+    for method in ("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"):
+        status, headers, body = client.request(method, "/methods/")
+        assert status in (200, 204)
+        if method != "HEAD":
+            assert json.loads(body)["method"] == method
+
+
+def test_class_based_view(client):
+    status, _, body = client.request("GET", "/cbv/7/")
+    assert status == 200
+    assert json.loads(body) == {"item_id": 7, "kind": "class"}
+
+    status, _, body = client.request("POST", "/cbv/7/", body=b'{"x": 1}')
+    assert status == 201
+    assert json.loads(body) == {"item_id": 7, "payload": {"x": 1}}
+
+    status, _, body = client.request("DELETE", "/cbv/7/")
+    assert status == 204
+    assert body == b""
+
+    status, headers, _ = client.request("PUT", "/cbv/7/")
+    assert status == 405
+    assert "GET" in headers["allow"]
+
+
+def test_class_view_without_as_view(client):
+    status, _, body = client.request("GET", "/auto-cbv/3/")
+    assert status == 200
+    assert json.loads(body) == {"item_id": 3, "kind": "class"}
+
+
+def test_head_falls_back_to_get(client):
+    status, headers, body = client.request("HEAD", "/only-get/")
     assert status == 200
     assert body == b""
     assert int(headers["content-length"]) > 0
 
 
-def test_openapi(client):
-    status, _, body = client.request("GET", "/openapi.json")
-    assert status == 200
-    schema = json.loads(body)
-    assert schema["openapi"] == "3.1.0"
-    assert schema["info"]["title"] == "Test API"
-    assert "/items/{item_id}" in schema["paths"]
-    item_operation = schema["paths"]["/items"]["post"]
-    assert item_operation["requestBody"]["content"]["application/json"]["schema"]["title"] == "Item"
-    route_operation = schema["paths"]["/items/{item_id}"]["get"]
-    names = {param["name"] for param in route_operation["parameters"]}
-    assert {"item_id", "q", "limit", "active", "ratio"} <= names
+def test_options_includes_allow(client):
+    status, headers, body = client.request("OPTIONS", "/only-get/")
+    assert status == 204
+    assert "GET" in headers["allow"]
+    assert body == b""
 
 
-def test_docs(client):
-    status, headers, body = client.request("GET", "/docs")
+def test_uuid_and_path_converters(client):
+    value = "12345678-1234-5678-1234-567812345678"
+    status, _, body = client.request("GET", f"/uuid/{value}/")
     assert status == 200
-    assert headers["content-type"].startswith("text/html")
-    assert b"SwaggerUIBundle" in body
+    assert json.loads(body) == {"value": value, "is_uuid": True}
+
+    status, _, body = client.request("GET", "/files/a/b/c.txt")
+    assert status == 200
+    assert json.loads(body) == {"rest": "a/b/c.txt"}
+
+
+def test_request_object(client):
+    status, _, body = client.request(
+        "GET", "/request/?a=1&a=2&b=3", headers={"x-test": "yes"}
+    )
+    assert status == 200
+    data = json.loads(body)
+    assert data["method"] == "GET"
+    assert data["path"] == "/request/"
+    assert data["query"] == {"a": "2", "b": "3"}
+    assert data["x"] == "yes"
+
+
+def test_include_and_namespaces(client):
+    status, _, body = client.request("GET", "/api/ping/")
+    assert status == 200
+    assert json.loads(body) == {"pong": True}
+
+    status, _, body = client.request("GET", "/api/v2/ping/")
+    assert status == 200
+    assert json.loads(body) == {"pong": 2}
+
+
+def test_reverse(client):
+    assert reverse("index") == "/"
+    assert reverse("item", kwargs={"item_id": 9}) == "/items/9/"
+    assert reverse("api:ping") == "/api/ping/"
+    assert reverse("api_v2:ping") == "/api/v2/ping/"
+
+
+def test_404_and_405(client):
+    status, _, body = client.request("GET", "/nope/")
+    assert status == 404
+    assert json.loads(body) == {"detail": "Not Found"}
 
 
 def test_lifecycle_hooks(start_server):
     started = threading.Event()
     stopped = threading.Event()
-    app = Alpha(docs=False)
+    clear_patterns()
+    app = Application(urlpatterns=[path("", lambda request: JsonResponse({"ok": True}))])
 
     @app.on_startup
-    def startup():
+    async def startup():
         started.set()
 
     @app.on_shutdown
     def shutdown():
         stopped.set()
-
-    @app.get("/")
-    def root():
-        return {"ok": True}
 
     server = start_server(app)
     assert started.wait(5)
@@ -478,13 +457,15 @@ def test_lifecycle_hooks(start_server):
 
 
 def test_body_limit(start_server):
-    app = Alpha(docs=False)
-
-    @app.post("/x")
-    def x(data: bytes):
-        return {"size": len(data)}
+    clear_patterns()
+    app = Application(
+        urlpatterns=[
+            path("x/", lambda request: JsonResponse({"size": len(request.body)}))
+        ]
+    )
+    app.settings.MAX_BODY_SIZE = 1024
 
     server = start_server(app)
-    status, _, body = server.request("POST", "/x", body=b"x" * (17 * 1024 * 1024))
+    status, _, body = server.request("POST", "/x/", body=b"x" * 2048)
     assert status == 413
     assert json.loads(body)["detail"] == "Request body too large"

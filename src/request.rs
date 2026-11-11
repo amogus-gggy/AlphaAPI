@@ -5,10 +5,12 @@ use http::{HeaderMap, Method};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyString};
 
-/// An incoming HTTP request.
+/// The raw incoming HTTP request.
 ///
-/// Instances are created by the Rust core and injected into handlers that
-/// declare a parameter annotated with `alphaapi.Request`.
+/// Instances are created by the Rust core and passed to the Python routing
+/// layer, which wraps them in `alphaapi.http.HttpRequest` for views and
+/// middleware.  They can also be injected directly when a low-level request
+/// object is needed.
 #[pyclass(frozen, module = "alphaapi._core")]
 pub struct Request {
     pub method: Method,

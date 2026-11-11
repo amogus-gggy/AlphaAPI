@@ -3,7 +3,7 @@ name = "alphaapi"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.83"
-description = "A fast, FastAPI-inspired Python web framework powered by Rust"
+description = "A fast, Django-shaped async Python web framework powered by Rust"
 license = "MIT"
 readme = "README.md"
 

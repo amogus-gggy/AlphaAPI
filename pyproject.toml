@@ -5,12 +5,12 @@ build-backend = "maturin"
 [project]
 name = "alphaapi"
 version = "0.1.0"
-description = "A fast, FastAPI-inspired Python web framework with a Rust core"
+description = "A Django-shaped, async-native Python web framework with a Rust core"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
 authors = [{ name = "AlphaAPI contributors" }]
-keywords = ["web", "framework", "http", "rust", "fastapi", "asyncio"]
+keywords = ["web", "framework", "http", "rust", "django", "asyncio"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Framework :: AsyncIO",
@@ -28,6 +28,8 @@ pydantic = ["pydantic>=2"]
 dev = [
     "pytest>=8",
     "pydantic>=2",
+]
+bench = [
     "fastapi>=0.110",
     "uvicorn>=0.30",
 ]

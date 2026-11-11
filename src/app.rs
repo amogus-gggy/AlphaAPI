@@ -995,6 +995,28 @@ fn handle_python_error(
     error: PyErr,
     request: &RequestData,
 ) -> BuiltResponse {
+    // User supplied exception handlers take precedence so applications can
+    // override the built-in HTTPException rendering.
+    for (exc_type, handler) in &state.exception_handlers {
+        if error.is_instance(py, exc_type.bind(py)) {
+            let request_object = match Py::new(py, request.to_request()) {
+                Ok(request) => request.into_any(),
+                Err(inner) => {
+                    inner.print(py);
+                    break;
+                }
+            };
+            let exception = error.value(py).clone().into_any().unbind();
+            match handler.call1(py, (request_object, exception)) {
+                Ok(value) => return serialize_result(py, value, 200),
+                Err(handler_error) => {
+                    handler_error.print(py);
+                    break;
+                }
+            }
+        }
+    }
+
     // Built-in HTTPException support.
     if let Some(exc_type) = &state.http_exception_type {
         if error.is_instance(py, exc_type.bind(py)) {
@@ -1032,27 +1054,6 @@ fn handle_python_error(
                 body,
                 headers,
             );
-        }
-    }
-
-    // User supplied exception handlers.
-    for (exc_type, handler) in &state.exception_handlers {
-        if error.is_instance(py, exc_type.bind(py)) {
-            let request_object = match Py::new(py, request.to_request()) {
-                Ok(request) => request.into_any(),
-                Err(inner) => {
-                    inner.print(py);
-                    break;
-                }
-            };
-            let exception = error.value(py).clone().into_any().unbind();
-            match handler.call1(py, (request_object, exception)) {
-                Ok(value) => return serialize_result(py, value, 200),
-                Err(handler_error) => {
-                    handler_error.print(py);
-                    break;
-                }
-            }
         }
     }
 

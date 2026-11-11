@@ -6,8 +6,8 @@ use crate::util::{content_to_bytes, headers_to_vec};
 /// A full HTTP response.
 ///
 /// Returning a `Response` from a handler bypasses automatic serialization.
-/// The higher-level `JSONResponse`, `PlainTextResponse`, `HTMLResponse` and
-/// `RedirectResponse` classes build on top of this type.
+/// The higher-level Django-style response classes in `alphaapi.http` build on
+/// top of this type.
 #[pyclass(subclass, module = "alphaapi._core")]
 pub struct Response {
     pub status_code: u16,

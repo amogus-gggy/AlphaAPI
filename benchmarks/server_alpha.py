@@ -3,24 +3,28 @@ from __future__ import annotations
 
 import os
 
-from alphaapi import Alpha
-
-app = Alpha(docs=False)
+from alphaapi import Application, JsonResponse, path
 
 
-@app.get("/json")
-def json_endpoint():
-    return {"message": "Hello, World!", "number": 42, "ok": True}
+def json_endpoint(request):
+    return JsonResponse({"message": "Hello, World!", "number": 42, "ok": True})
 
 
-@app.get("/plaintext")
-def plaintext_endpoint():
+def plaintext_endpoint(request):
     return "Hello, World!"
 
 
-@app.get("/items/{item_id}")
-def item_endpoint(item_id: int):
-    return {"item_id": item_id, "name": f"item-{item_id}"}
+def item_endpoint(request, item_id: int):
+    return JsonResponse({"item_id": item_id, "name": f"item-{item_id}"})
+
+
+urlpatterns = [
+    path("/json", json_endpoint),
+    path("/plaintext", plaintext_endpoint),
+    path("/items/<int:item_id>", item_endpoint),
+]
+
+app = Application(urlpatterns=urlpatterns)
 
 
 if __name__ == "__main__":
