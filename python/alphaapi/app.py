@@ -9,6 +9,8 @@ from __future__ import annotations
 import asyncio
 import importlib
 import inspect
+import signal
+import threading
 from types import SimpleNamespace
 from typing import Any, Callable, Iterable
 
@@ -401,16 +403,66 @@ class Application:
             access_log = bool(self.settings.ACCESS_LOG)
 
         self._run_lifecycle(self._startup)
+
+        # SIGINT needs special care.  The Rust server installs its own handler
+        # while it runs, but there is a window before that where Python's
+        # default handler would raise KeyboardInterrupt in the middle of
+        # startup, and a window during cleanup where it would abort joining the
+        # asyncio bridge.  On the main thread, run the blocking server in a
+        # worker thread so the main thread can always catch SIGINT and ask the
+        # core to stop; the shutdown notification is remembered by the core, so
+        # this also covers signals that arrive before the server is listening.
+        interrupted = [False]
+        failure: list[BaseException] = []
+
+        def _serve() -> None:
+            try:
+                self._core.run(
+                    host=host,
+                    port=port,
+                    workers=workers,
+                    max_body_size=max_body_size,
+                    access_log=access_log,
+                )
+            except BaseException as error:  # re-raised on the calling thread
+                failure.append(error)
+
+        previous_handler: Any = None
+        handler_installed = False
         try:
-            self._core.run(
-                host=host,
-                port=port,
-                workers=workers,
-                max_body_size=max_body_size,
-                access_log=access_log,
-            )
+            if threading.current_thread() is threading.main_thread():
+
+                def _on_sigint(signum: int, frame: Any) -> None:
+                    interrupted[0] = True
+
+                previous_handler = signal.getsignal(signal.SIGINT)
+                signal.signal(signal.SIGINT, _on_sigint)
+                handler_installed = True
+
+                worker = threading.Thread(target=_serve, name="alphaapi-server")
+                worker.start()
+                # Joining with a timeout lets the main thread run pending
+                # Python signal handlers even when SIGINT arrives before the
+                # Rust core has installed its own handler.  Once seen, stop the
+                # core from here rather than inside the signal handler; the
+                # core remembers the notification, so early signals are safe.
+                while worker.is_alive():
+                    worker.join(0.1)
+                    if interrupted[0]:
+                        self._core.stop()
+            else:
+                # Callers such as tests drive ``run`` from their own thread and
+                # keep control of signals themselves.
+                _serve()
         finally:
+            if handler_installed:
+                signal.signal(signal.SIGINT, previous_handler)
             self._run_lifecycle(self._shutdown)
+
+        if failure:
+            raise failure[0]
+        if interrupted[0]:
+            raise KeyboardInterrupt
 
     # ``runserver`` is the Django-flavoured alias.
     runserver = run

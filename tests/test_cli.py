@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import signal
+import socket
 import subprocess
 import sys
+import time
 
 import pytest
 
@@ -63,3 +66,47 @@ def test_startproject_rejects_non_empty_destination(tmp_path):
 def test_startapp_rejects_invalid_name(tmp_path):
     with pytest.raises(ScaffoldError):
         startapp("not-a-package", tmp_path)
+
+
+def _free_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def test_generated_manage_py_exits_on_sigint(tmp_path):
+    target = tmp_path / "site"
+    startproject("demo", target)
+    port = _free_port()
+
+    process = subprocess.Popen(
+        [sys.executable, "manage.py", "--port", str(port)],
+        cwd=target,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        for _ in range(200):
+            if process.poll() is not None:
+                break
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=0.1):
+                    break
+            except OSError:
+                time.sleep(0.02)
+        else:
+            pytest.fail("generated project did not start")
+
+        assert process.poll() is None
+        process.send_signal(signal.SIGINT)
+        try:
+            code = process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            pytest.fail("manage.py ignored SIGINT")
+        assert code == 0
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+

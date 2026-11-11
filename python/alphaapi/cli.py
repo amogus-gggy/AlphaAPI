@@ -189,13 +189,16 @@ def main(argv: list[str] | None = None) -> None:
             _run_with_reload(args)
             return
         app = load_app(args.app)
-        app.run(
-            host=args.host,
-            port=args.port,
-            workers=args.workers,
-            max_body_size=args.max_body_size,
-            access_log=args.access_log,
-        )
+        try:
+            app.run(
+                host=args.host,
+                port=args.port,
+                workers=args.workers,
+                max_body_size=args.max_body_size,
+                access_log=args.access_log,
+            )
+        except KeyboardInterrupt:
+            pass
 
 
 if __name__ == "__main__":
