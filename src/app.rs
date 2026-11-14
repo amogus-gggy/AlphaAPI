@@ -12,7 +12,8 @@ use http_body_util::{BodyExt, Full};
 use hyper::body::{Body as _, Incoming};
 use hyper::service::service_fn;
 use hyper::{Request as HyperRequest, Response as HyperResponse};
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::server::conn::auto;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyByteArray, PyBytes, PyDict, PyList, PyString, PyTuple};
@@ -382,14 +383,15 @@ async fn serve(
                             )
                         }
                     });
-                    // HTTP/1 is the overwhelming majority of API traffic and
-                    // avoids the protocol-detection overhead of the auto
-                    // (HTTP/1 + HTTP/2) builder.
-                    let _ = hyper::server::conn::http1::Builder::new()
+                    // Detect HTTP/1 vs HTTP/2 (cleartext, prior knowledge)
+                    // from the first bytes on the connection. TLS is expected
+                    // to be terminated by a reverse proxy.
+                    let mut builder = auto::Builder::new(TokioExecutor::new());
+                    builder
+                        .http1()
                         .keep_alive(true)
-                        .pipeline_flush(true)
-                        .serve_connection(io, service)
-                        .await;
+                        .pipeline_flush(true);
+                    let _ = builder.serve_connection(io, service).await;
                 });
             }
         }
@@ -524,9 +526,12 @@ enum BodyError {
 /// Collect a request body with a size limit.
 ///
 /// The common case (one data frame) is returned without copying: the frame's
-/// `Bytes` buffer is used directly.  Multiple frames are merged exactly once.
+/// `Bytes` buffer is used directly.  For multiple frames, only the second frame
+/// is copied once; the remaining frames are appended to a geometrically growing
+/// `BytesMut`, so total work stays linear in the body size.
 async fn read_body(mut body: Incoming, max_size: usize) -> Result<Bytes, BodyError> {
-    let mut buffer: Option<Bytes> = None;
+    let mut first: Option<Bytes> = None;
+    let mut combined: Option<BytesMut> = None;
     let mut total = 0usize;
 
     while let Some(frame) = body.frame().await {
@@ -541,18 +546,30 @@ async fn read_body(mut body: Incoming, max_size: usize) -> Result<Bytes, BodyErr
             return Err(BodyError::TooLarge);
         }
 
-        buffer = Some(match buffer {
-            None => data,
-            Some(existing) => {
-                let mut merged = BytesMut::with_capacity(total);
-                merged.extend_from_slice(&existing);
-                merged.extend_from_slice(&data);
-                merged.freeze()
+        if let Some(buffer) = combined.as_mut() {
+            // BytesMut grows geometrically, so extending once per frame is
+            // amortized linear in the total body size.
+            buffer.extend_from_slice(&data);
+        } else {
+            match first.take() {
+                None => first = Some(data),
+                Some(existing) => {
+                    // Only the second frame forces a copy. Afterwards the
+                    // BytesMut absorbs all remaining frames without
+                    // re-copying the data collected so far.
+                    let mut merged = BytesMut::with_capacity(total);
+                    merged.extend_from_slice(&existing);
+                    merged.extend_from_slice(&data);
+                    combined = Some(merged);
+                }
             }
-        });
+        }
     }
 
-    Ok(buffer.unwrap_or_default())
+    Ok(match combined {
+        Some(buffer) => buffer.freeze(),
+        None => first.unwrap_or_default(),
+    })
 }
 
 fn method_not_allowed(methods: &HashMap<Method, usize>) -> HyperResponse<Full<Bytes>> {

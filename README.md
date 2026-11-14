@@ -472,8 +472,9 @@ Rust.
 - No regular-expression URL routes; use path converters.
 - No WebSocket support.
 - One body representation per view (access it through the request).
-- HTTP/2 and TLS are not built in; place the server behind a reverse proxy if
-  you need them.
+- HTTP/2 is supported over cleartext connections (h2c, prior knowledge) and is
+  auto-detected alongside HTTP/1.1. TLS is not built in; place the server behind
+  a reverse proxy if you need HTTPS.
 - Sync views should stay short. Long CPU-bound work should move to async code or
   another process.
 - Async exception handlers are not driven automatically; exception handlers run

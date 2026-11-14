@@ -3,9 +3,10 @@
 This guide explains how an AlphaAPI project fits together and how to run it
 safely in production.
 
-AlphaAPI includes its own HTTP/1.1 server. It does **not** expose an ASGI or WSGI
-application, and TLS/HTTP/2 are not built in. In production, put AlphaAPI behind
-a reverse proxy such as nginx, Caddy, or a cloud load balancer.
+AlphaAPI includes its own HTTP/1.1 and HTTP/2 (cleartext, prior knowledge)
+server. It does **not** expose an ASGI or WSGI application, and TLS is not built
+in. In production, put AlphaAPI behind a reverse proxy such as nginx, Caddy, or
+a cloud load balancer to terminate TLS.
 
 ## Project layout
 
@@ -167,8 +168,9 @@ sudo systemctl status alphaapi-blog
 
 ## Reverse proxy
 
-AlphaAPI speaks HTTP/1.1. Terminate TLS at the proxy and forward requests to
-the local AlphaAPI port. Example nginx configuration:
+AlphaAPI accepts both HTTP/1.1 and HTTP/2 cleartext (h2c, prior knowledge).
+Terminate TLS at the proxy and forward requests to the local AlphaAPI port.
+Example nginx configuration:
 
 ```nginx title="/etc/nginx/sites-available/alphaapi-blog"
 server {
