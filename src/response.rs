@@ -38,7 +38,7 @@ impl Response {
         py: Python<'_>,
         content: Option<&Bound<'_, PyAny>>,
         status_code: u16,
-        headers: Option<&Bound<'_, PyDict>>,
+        headers: Option<&Bound<'_, PyAny>>,
         media_type: Option<String>,
     ) -> PyResult<Self> {
         let body = match content {
@@ -73,9 +73,48 @@ impl Response {
     }
 
     #[setter]
-    fn set_headers(&mut self, headers: &Bound<'_, PyDict>) -> PyResult<()> {
-        self.headers = headers_to_vec(Some(headers))?;
+    fn set_headers(&mut self, headers: Option<&Bound<'_, PyAny>>) -> PyResult<()> {
+        self.headers = headers_to_vec(headers)?;
         Ok(())
+    }
+
+    /// All header values, preserving duplicates such as multiple `Set-Cookie`
+    /// fields.
+    fn header_items(&self) -> Vec<(String, String)> {
+        self.headers.clone()
+    }
+
+    /// Append a header without replacing existing values with the same name.
+    fn add_header(&mut self, name: &str, value: &str) {
+        self.headers.push((name.to_string(), value.to_string()));
+    }
+
+    /// Replace every existing value for `name` (case-insensitive).
+    fn set_header(&mut self, name: &str, value: &str) {
+        self.headers
+            .retain(|(key, _)| !key.eq_ignore_ascii_case(name));
+        self.headers.push((name.to_string(), value.to_string()));
+    }
+
+    /// Remove every value for `name`. Returns whether anything was removed.
+    fn remove_header(&mut self, name: &str) -> bool {
+        let before = self.headers.len();
+        self.headers
+            .retain(|(key, _)| !key.eq_ignore_ascii_case(name));
+        before != self.headers.len()
+    }
+
+    /// All values for `name` (case-insensitive), in insertion order.
+    fn get_all_headers(&self, name: &str) -> Vec<String> {
+        self.headers
+            .iter()
+            .filter(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.clone())
+            .collect()
+    }
+
+    fn clear_headers(&mut self) {
+        self.headers.clear();
     }
 
     #[getter]

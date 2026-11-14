@@ -54,6 +54,11 @@ class OnlyGetView(View):
         return JsonResponse({"only": "get"})
 
 
+class OnlyPostView(View):
+    async def post(self, request):
+        return JsonResponse({"only": "post"})
+
+
 def build_app() -> Application:
     clear_patterns()
 
@@ -141,6 +146,12 @@ def build_app() -> Application:
             }
         )
 
+    async def two_cookies(request):
+        response = HttpResponse("cookies")
+        response.set_cookie("first", "one")
+        response.set_cookie("second", "two")
+        return response
+
     api_patterns = [
         path("ping/", lambda request: JsonResponse({"pong": True}), name="ping"),
     ]
@@ -173,6 +184,8 @@ def build_app() -> Application:
         path("cbv/<int:item_id>/", ItemView.as_view(), name="cbv"),
         path("auto-cbv/<int:item_id>/", ItemView, name="auto-cbv"),
         path("only-get/", OnlyGetView.as_view(), name="only-get"),
+        path("only-post/", OnlyPostView.as_view(), name="only-post"),
+        path("cookies/", two_cookies, name="cookies"),
         path("api/", include((api_patterns, "api"))),
         path("api/v2/", include((v2_patterns, "api_v2"))),
     ]
@@ -380,6 +393,46 @@ def test_head_falls_back_to_get(client):
     assert status == 200
     assert body == b""
     assert int(headers["content-length"]) > 0
+
+
+def test_head_without_get_returns_405(client):
+    status, headers, body = client.request("HEAD", "/only-post/")
+    assert status == 405
+    assert "POST" in headers["allow"]
+    assert body == b""
+
+
+def test_multiple_set_cookie_headers(client):
+    import http.client
+
+    connection = http.client.HTTPConnection("127.0.0.1", client.port, timeout=10)
+    try:
+        connection.request("GET", "/cookies/")
+        response = connection.getresponse()
+        response.read()
+        cookies = [
+            value
+            for name, value in response.getheaders()
+            if name.lower() == "set-cookie"
+        ]
+    finally:
+        connection.close()
+
+    assert len(cookies) == 2
+    assert cookies[0].startswith("first=one")
+    assert cookies[1].startswith("second=two")
+
+
+def test_json_response_is_serialized_in_rust(monkeypatch):
+    from alphaapi.http import response as response_module
+
+    def fail(*args, **kwargs):
+        raise AssertionError("JsonResponse must not call json.dumps")
+
+    monkeypatch.setattr(response_module.json, "dumps", fail)
+    response = JsonResponse({"hello": "world", "items": [1, 2]})
+    assert json.loads(response.body) == {"hello": "world", "items": [1, 2]}
+    assert response.media_type == "application/json"
 
 
 def test_options_includes_allow(client):

@@ -8,6 +8,7 @@ import time
 
 import pytest
 
+from alphaapi import cli
 from alphaapi.cli import main
 from alphaapi.scaffold import ScaffoldError, startapp, startproject
 
@@ -66,6 +67,35 @@ def test_startproject_rejects_non_empty_destination(tmp_path):
 def test_startapp_rejects_invalid_name(tmp_path):
     with pytest.raises(ScaffoldError):
         startapp("not-a-package", tmp_path)
+
+
+def test_run_options_do_not_override_settings_defaults(monkeypatch):
+    class DummyApp:
+        def __init__(self):
+            self.kwargs = None
+
+        def run(self, **kwargs):
+            self.kwargs = kwargs
+
+    app = DummyApp()
+    monkeypatch.setattr(cli, "load_app", lambda target: app)
+
+    main(["runserver", "demo.app:app"])
+    assert app.kwargs["max_body_size"] is None
+    assert app.kwargs["access_log"] is None
+
+    main(["runserver", "demo.app:app", "--access-log", "--max-body-size", "1024"])
+    assert app.kwargs["max_body_size"] == 1024
+    assert app.kwargs["access_log"] is True
+
+
+def test_reload_command_omits_unset_options():
+    parser = cli.argparse.ArgumentParser()
+    cli._add_run_options(parser)
+    args = parser.parse_args(["demo.app:app"])
+    command = cli._command(args)
+    assert "--max-body-size" not in command
+    assert "--access-log" not in command
 
 
 def _free_port() -> int:

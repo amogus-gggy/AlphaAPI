@@ -1,0 +1,107 @@
+site_name: AlphaAPI
+site_description: A Django-shaped, async-native Python web framework with a Rust HTTP core.
+site_url: https://amogus-gggy.github.io/AlphaAPI/
+repo_url: https://github.com/amogus-gggy/AlphaAPI
+repo_name: amogus-gggy/AlphaAPI
+edit_uri: edit/main/docs/
+copyright: Copyright &copy; AlphaAPI contributors
+
+theme:
+  name: material
+  language: en
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.indexes
+    - navigation.top
+    - navigation.footer
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.code.annotate
+    - toc.follow
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: deep purple
+      accent: teal
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: deep purple
+      accent: teal
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+
+extra_css:
+  - stylesheets/extra.css
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.tasklist:
+      custom_checkbox: true
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+
+plugins:
+  - search
+  - mkdocstrings:
+      default_handler: python
+      handlers:
+        python:
+          paths: [python]
+          options:
+            docstring_style: google
+            show_source: true
+            show_root_heading: true
+            show_root_full_path: false
+            show_symbol_type_heading: true
+            show_symbol_type_toc: true
+            separate_signature: true
+            show_signature_annotations: true
+            signature_crossrefs: true
+            merge_init_into_class: true
+            filters: ["!^_"]
+
+watch:
+  - python/alphaapi
+
+nav:
+  - Home: index.md
+  - Getting started: getting-started.md
+  - Tutorials:
+      - tutorials/index.md
+      - Build a task API: tutorials/task-api.md
+      - Build a blog: tutorials/blog.md
+      - Project layout & deployment: tutorials/deployment.md
+  - API Reference:
+      - api/index.md
+      - Application: api/application.md
+      - Requests: api/requests.md
+      - Responses: api/responses.md
+      - Views: api/views.md
+      - Routing: api/routing.md
+      - Settings: api/settings.md
+      - Exceptions: api/exceptions.md
+      - Middleware: api/middleware.md
+      - Apps: api/apps.md
+      - Low-level core: api/core.md

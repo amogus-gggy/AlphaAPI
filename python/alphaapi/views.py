@@ -42,14 +42,25 @@ class View:
             setattr(self, key, value)
 
     def _allowed_methods(self) -> list[str]:
-        return [
+        methods = [
             method.upper()
             for method in self.http_method_names
-            if hasattr(self, method)
+            if method != "head" and hasattr(self, method)
         ]
+        # HEAD is served by an explicit ``head`` method when present, or by
+        # falling back to ``get``.  It is not supported when neither exists.
+        if hasattr(self, "head") or hasattr(self, "get"):
+            methods.append("HEAD")
+        return methods
 
     async def dispatch(self, request: Any, *args: Any, **kwargs: Any) -> Any:
-        handler = getattr(self, request.method.lower(), self.http_method_not_allowed)
+        method = request.method.lower()
+        if method == "head":
+            handler = getattr(self, "head", None) or getattr(
+                self, "get", self.http_method_not_allowed
+            )
+        else:
+            handler = getattr(self, method, self.http_method_not_allowed)
         return await _await_if_needed(handler(request, *args, **kwargs))
 
     def http_method_not_allowed(self, request: Any, *args: Any, **kwargs: Any) -> Any:
@@ -59,9 +70,6 @@ class View:
         response = HttpResponse(b"", status=204)
         response["Allow"] = ", ".join(self._allowed_methods())
         return response
-
-    def head(self, request: Any, *args: Any, **kwargs: Any) -> Any:
-        return self.get(request, *args, **kwargs)
 
     @classmethod
     def as_view(cls, **initkwargs: Any) -> Callable[..., Any]:

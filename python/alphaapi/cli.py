@@ -56,9 +56,11 @@ def _command(args: argparse.Namespace) -> list[str]:
         args.host,
         "--port",
         str(args.port),
-        "--max-body-size",
-        str(args.max_body_size),
     ]
+    # Only forward options the user actually supplied.  Otherwise argparse's
+    # defaults would override values from the project's settings module.
+    if args.max_body_size is not None:
+        command += ["--max-body-size", str(args.max_body_size)]
     if args.workers:
         command += ["--workers", str(args.workers)]
     if args.access_log:
@@ -106,8 +108,10 @@ def _add_run_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--workers", type=int, default=None)
-    parser.add_argument("--max-body-size", type=int, default=16 * 1024 * 1024)
-    parser.add_argument("--access-log", action="store_true")
+    # ``None`` means "use the settings module value" rather than overriding it
+    # with argparse's default.
+    parser.add_argument("--max-body-size", type=int, default=None)
+    parser.add_argument("--access-log", action="store_true", default=None)
     parser.add_argument("--reload", action="store_true")
     parser.add_argument(
         "--settings",

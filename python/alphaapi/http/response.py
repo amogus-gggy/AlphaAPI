@@ -6,10 +6,77 @@ hot path (status, headers, body) is still handled by Rust.
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator, MutableMapping
 from typing import Any, Mapping
 
-from .._core import Response
+from .._core import Response, dumps
 from .._helpers import to_builtin
+
+
+def _coerce_header_items(headers: Any) -> list[tuple[str, str]]:
+    if isinstance(headers, Headers):
+        return headers.items(multi=True)
+    if hasattr(headers, "items"):
+        return [(str(key), str(value)) for key, value in headers.items()]
+    return [(str(key), str(value)) for key, value in headers]
+
+
+class Headers(MutableMapping[str, str]):
+    """A mutable, multi-value view over a response's headers.
+
+    Normal mapping access (``headers[key]``) returns the most recently added
+    value, while :meth:`add` and :meth:`get_all` preserve repeated fields such
+    as multiple ``Set-Cookie`` headers.
+    """
+
+    def __init__(self, response: "HttpResponse") -> None:
+        self._response = response
+
+    def __getitem__(self, key: str) -> str:
+        values = self._response.get_all_headers(key)
+        if not values:
+            raise KeyError(key)
+        return values[-1]
+
+    def __setitem__(self, key: str, value: str) -> None:
+        self._response.set_header(str(key), str(value))
+
+    def __delitem__(self, key: str) -> None:
+        if not self._response.remove_header(key):
+            raise KeyError(key)
+
+    def __iter__(self) -> Iterator[str]:
+        seen: set[str] = set()
+        for name, _ in self._response.header_items():
+            lowered = name.lower()
+            if lowered not in seen:
+                seen.add(lowered)
+                yield name
+
+    def __len__(self) -> int:
+        return sum(1 for _ in self)
+
+    def __contains__(self, key: object) -> bool:
+        return isinstance(key, str) and bool(self._response.get_all_headers(key))
+
+    def add(self, key: str, value: str) -> None:
+        """Append a value without removing existing values for ``key``."""
+        self._response.add_header(str(key), str(value))
+
+    def get_all(self, key: str) -> list[str]:
+        """Return every value for ``key`` in insertion order."""
+        return list(self._response.get_all_headers(key))
+
+    # Django-compatible alias.
+    getlist = get_all
+
+    def items(self, multi: bool = False) -> Any:  # type: ignore[override]
+        if multi:
+            return list(self._response.header_items())
+        return [(name, self[name]) for name in self]
+
+    def __repr__(self) -> str:
+        return repr(dict(self.items()))
 
 
 class HttpResponse(Response):
@@ -37,12 +104,27 @@ class HttpResponse(Response):
         if code is None:
             code = self.status_code_default
         self.status_code = code
-        self.headers = dict(headers or {})
+        self.headers = headers or {}
         if content_type is None:
             encoding = charset or "utf-8"
             content_type = f"text/html; charset={encoding}"
         self.media_type = content_type
         self.body = b"" if content is None else content
+
+    @property
+    def headers(self) -> Headers:
+        view = self.__dict__.get("_headers_view")
+        if view is None:
+            view = Headers(self)
+            self.__dict__["_headers_view"] = view
+        return view
+
+    @headers.setter
+    def headers(self, value: Any) -> None:
+        self.clear_headers()
+        view = self.headers
+        for key, item in _coerce_header_items(value or {}):
+            view.add(key, item)
 
     # -- Django-compatible conveniences -------------------------------------
 
@@ -63,20 +145,13 @@ class HttpResponse(Response):
         self.body = value
 
     def _set_header(self, key: str, value: str) -> None:
-        headers = dict(self.headers)
-        headers[key] = value
-        self.headers = headers
+        self.headers[key] = value
 
     def __setitem__(self, key: str, value: str) -> None:
         self._set_header(key, value)
 
     def __getitem__(self, key: str) -> str:
-        headers = self.headers
-        lowered = key.lower()
-        for name, value in headers.items():
-            if name.lower() == lowered:
-                return value
-        raise KeyError(key)
+        return self.headers[key]
 
     def set_cookie(
         self,
@@ -104,7 +179,8 @@ class HttpResponse(Response):
             parts.append("HttpOnly")
         if samesite:
             parts.append(f"SameSite={samesite}")
-        self._set_header("Set-Cookie", "; ".join(parts))
+        # Cookies are a repeated header: never replace an earlier Set-Cookie.
+        self.headers.add("Set-Cookie", "; ".join(parts))
 
     def delete_cookie(self, key: str, *, path: str = "/", domain: str | None = None) -> None:
         self.set_cookie(
@@ -143,10 +219,18 @@ class JsonResponse(HttpResponse):
                 "In order to allow non-dict/list objects to be serialized, "
                 "pass safe=False to JsonResponse."
             )
-        self.body = json.dumps(
-            to_builtin(data),
-            **dict(json_dumps_params or {"ensure_ascii": False}),
-        ).encode("utf-8")
+        if json_dumps_params:
+            # Custom ``json.dumps`` options are rare; keep them working by
+            # falling back to the standard library for that case.
+            payload = json.dumps(
+                to_builtin(data),
+                **dict(json_dumps_params),
+            ).encode("utf-8")
+        else:
+            # Serialize in Rust, including the fallback that normalizes
+            # Pydantic models, dataclasses, enums, datetimes, and so on.
+            payload = dumps(data)
+        self.body = payload
 
 
 class HttpResponseRedirectBase(HttpResponse):

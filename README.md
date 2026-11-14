@@ -417,6 +417,22 @@ Absolute numbers vary with CPU frequency scaling; the relative gap has stayed
 around 12–22x. Use `--python-load` to fall back to the dependency-free Python
 load client.
 
+## Documentation
+
+The documentation site is built with [MkDocs Material](https://squidfunk.github.io/mkdocs-material/)
+and [mkdocstrings](https://mkdocstrings.github.io/), so the API reference is
+generated from the source and docstrings.
+
+```bash
+pip install -e '.[docs]'
+mkdocs serve          # live preview at http://127.0.0.1:8000
+mkdocs build --strict # static site in ./site
+```
+
+The site includes a getting-started guide, a task API tutorial, a blog tutorial,
+a deployment guide, and the complete API reference. Pushing changes to `main`
+runs the `docs` GitHub Actions workflow and deploys the site to GitHub Pages.
+
 ## Testing
 
 ```bash

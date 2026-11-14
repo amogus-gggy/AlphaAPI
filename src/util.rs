@@ -196,12 +196,35 @@ pub fn content_to_bytes(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<Vec<
     json_bytes(py, obj)
 }
 
-pub fn headers_to_vec(headers: Option<&Bound<'_, PyDict>>) -> PyResult<Vec<(String, String)>> {
+pub fn headers_to_vec(headers: Option<&Bound<'_, PyAny>>) -> PyResult<Vec<(String, String)>> {
     let mut result = Vec::new();
-    if let Some(headers) = headers {
-        for (key, value) in headers.iter() {
+    let Some(headers) = headers else {
+        return Ok(result);
+    };
+
+    // Accept either a mapping (the common case) or an iterable of
+    // ``(name, value)`` pairs, which can represent repeated headers such as
+    // multiple ``Set-Cookie`` fields.
+    if let Ok(dict) = headers.cast::<PyDict>() {
+        for (key, value) in dict.iter() {
             result.push((key.extract::<String>()?, value.extract::<String>()?));
         }
+        return Ok(result);
+    }
+
+    for item in headers.try_iter()? {
+        let item = item?;
+        let pair = item.cast::<PyTuple>().map_err(|_| {
+            PyValueError::new_err("headers must be a mapping or an iterable of (name, value) pairs")
+        })?;
+        if pair.len() != 2 {
+            return Err(PyValueError::new_err(
+                "header pairs must contain exactly two items",
+            ));
+        }
+        let key = pair.get_item(0)?;
+        let value = pair.get_item(1)?;
+        result.push((key.extract::<String>()?, value.extract::<String>()?));
     }
     Ok(result)
 }
