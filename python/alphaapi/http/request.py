@@ -8,9 +8,10 @@ from __future__ import annotations
 
 from http.cookies import SimpleCookie
 from typing import Any, Iterable
-from urllib.parse import parse_qsl
+from urllib.parse import parse_qsl, urljoin
 
 from .._core import Request as _RawRequest
+from .multipart import UploadedFile, parse_multipart
 
 
 class QueryDict(dict):
@@ -88,28 +89,45 @@ class HttpRequest:
         self.query_string = raw.query_string
         self.client = raw.client
         self.headers = raw.headers
+        self.content_type = self.headers.get("content-type", "")
         self.META = {
             "REQUEST_METHOD": self.method,
             "PATH_INFO": self.path,
             "QUERY_STRING": self.query_string,
             "REMOTE_ADDR": self.client,
-            "CONTENT_TYPE": self.headers.get("content-type", ""),
+            "CONTENT_TYPE": self.content_type,
             "CONTENT_LENGTH": self.headers.get("content-length", ""),
             "HTTP_HOST": self.headers.get("host", ""),
         }
+        for name, value in self.headers.items():
+            key = "HTTP_" + name.upper().replace("-", "_")
+            if key not in self.META:
+                self.META[key] = value
         self.GET = QueryDict(raw.query_params)
-        self.POST = self._parse_form()
+        self.POST, self.FILES = self._parse_form()
         self.COOKIES = _parse_cookies(self.headers.get("cookie", ""))
 
-    def _parse_form(self) -> QueryDict:
-        content_type = self.headers.get("content-type", "").split(";", 1)[0].strip()
-        if content_type != "application/x-www-form-urlencoded":
-            return QueryDict()
-        try:
-            text = self._raw.body.decode("utf-8", "replace")
-        except Exception:
-            return QueryDict()
-        return QueryDict(parse_qsl(text, keep_blank_values=True))
+    def _parse_form(self) -> tuple[QueryDict, dict[str, Any]]:
+        content_type = self.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+        if content_type == "application/x-www-form-urlencoded":
+            try:
+                text = self._raw.body.decode("utf-8", "replace")
+            except Exception:
+                return QueryDict(), {}
+            return QueryDict(parse_qsl(text, keep_blank_values=True)), {}
+
+        if content_type == "multipart/form-data":
+            fields, files = parse_multipart(
+                self._raw.body, self.headers.get("content-type", "")
+            )
+            post = QueryDict(fields)
+            mapped: dict[str, Any] = {
+                name: values[0] if len(values) == 1 else values
+                for name, values in files.items()
+            }
+            return post, mapped
+
+        return QueryDict(), {}
 
     @property
     def body(self) -> bytes:
@@ -132,8 +150,41 @@ class HttpRequest:
     def get_host(self) -> str:
         return self.headers.get("host", "")
 
+    @property
+    def scheme(self) -> str:
+        if self.is_secure():
+            return "https"
+        return "http"
+
     def is_secure(self) -> bool:
-        return self.headers.get("x-forwarded-proto", "http") == "https"
+        from ..conf import settings
+
+        if not bool(getattr(settings, "TRUST_PROXY_HEADERS", False)):
+            return False
+        header = getattr(settings, "SECURE_PROXY_SSL_HEADER", "x-forwarded-proto")
+        value = self.headers.get(header.lower(), "")
+        return value.split(",", 1)[0].strip().lower() == "https"
+
+    def get_full_path(self) -> str:
+        return self.path + (f"?{self.query_string}" if self.query_string else "")
+
+    def build_absolute_uri(self, location: str | None = None) -> str:
+        host = self.get_host()
+        base = f"{self.scheme}://{host}" if host else f"{self.scheme}://localhost"
+        if location is None:
+            return base + self.get_full_path()
+        return urljoin(base + self.path, location)
+
+    def accepts(self, content_type: str) -> bool:
+        accept = self.headers.get("accept", "*/*")
+        content_type = content_type.split(";", 1)[0].strip().lower()
+        for item in accept.split(","):
+            candidate = item.split(";", 1)[0].strip().lower()
+            if candidate in {"*/*", content_type}:
+                return True
+            if candidate.endswith("/*") and content_type.startswith(candidate[:-1]):
+                return True
+        return False
 
     def __getitem__(self, key: str) -> Any:
         try:

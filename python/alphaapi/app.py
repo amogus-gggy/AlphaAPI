@@ -6,7 +6,6 @@ and the HTTP server/routing hot path stays in Rust.
 """
 from __future__ import annotations
 
-import asyncio
 import importlib
 import inspect
 import signal
@@ -25,6 +24,8 @@ from .http import (
     HttpResponseNotFound,
     JsonResponse,
 )
+from .middleware import is_async_callable
+from .params import build_param_specs
 from .urls import (
     ImproperlyConfigured,
     ResolvedPattern,
@@ -122,6 +123,8 @@ class Application:
             middleware if middleware is not None else self.settings.MIDDLEWARE
         )
 
+        self._add_builtin_urls()
+
         self._core = _core.AppCore()
         self._exception_handlers: dict[type[BaseException], Callable[..., Any]] = {}
         self._startup: list[Callable[..., Any]] = []
@@ -132,9 +135,53 @@ class Application:
 
     # -- URL configuration --------------------------------------------------
 
+    def _add_builtin_urls(self) -> None:
+        """Add optional static/OpenAPI routes before the first resolve."""
+        from .urls import path
+
+        existing = {getattr(pattern, "route", None) for pattern in self._urlpatterns}
+
+        static_root = getattr(self.settings, "STATIC_ROOT", None)
+        if static_root:
+            from .staticfiles import StaticFiles
+
+            prefix = "/" + str(getattr(self.settings, "STATIC_URL", "/static/")).strip("/") + "/"
+            route = prefix + "<path:path>"
+            if route not in existing:
+                self._urlpatterns.append(
+                    path(
+                        route,
+                        StaticFiles(str(static_root), prefix),
+                        name="static",
+                    )
+                )
+
+        if bool(getattr(self.settings, "ENABLE_OPENAPI", False)):
+            from .openapi import docs_view, openapi_view
+
+            openapi_url = str(getattr(self.settings, "OPENAPI_URL", "/openapi.json")).lstrip("/")
+            docs_url = str(getattr(self.settings, "DOCS_URL", "/docs")).lstrip("/")
+            if openapi_url not in {str(route or "").lstrip("/") for route in existing}:
+                self._urlpatterns.append(
+                    path(openapi_url, openapi_view(self), name="openapi")
+                )
+            if docs_url not in {str(route or "").lstrip("/") for route in existing}:
+                self._urlpatterns.append(path(docs_url, docs_view(self), name="api-docs"))
+
     @property
     def urlpatterns(self) -> list[Any]:
         return list(self._urlpatterns)
+
+    def openapi(self) -> dict[str, Any]:
+        """Return an OpenAPI 3 document for the application."""
+        from .openapi import build_openapi
+
+        return build_openapi(self)
+
+    def test_client(self, **kwargs: Any) -> Any:
+        from .testing import Client
+
+        return Client(self, **kwargs)
 
     @staticmethod
     def _coerce_patterns(source: Iterable[Any] | str | Any) -> list[Any]:
@@ -193,15 +240,13 @@ class Application:
 
         return decorator
 
-    @staticmethod
-    def _run_lifecycle(funcs: Iterable[Callable[..., Any]]) -> None:
+    def _run_lifecycle(self, funcs: Iterable[Callable[..., Any]]) -> None:
+        # Startup/shutdown hooks run on the same asyncio loop that drives async
+        # views, so pools and clients created here stay usable during requests.
         for func in funcs:
-            if inspect.iscoroutinefunction(func):
-                asyncio.run(func())
-            else:
-                result = func()
-                if inspect.isawaitable(result):
-                    asyncio.run(result)
+            result = func()
+            if inspect.isawaitable(result):
+                self._core.run_on_event_loop(result)
 
     def stop(self) -> None:
         """Ask a running server to shut down."""
@@ -229,31 +274,38 @@ class Application:
             for registered in self._exception_handlers
         )
 
-    def _make_handler(self, pattern: ResolvedPattern) -> tuple[Callable[..., Any], bool]:
+    def _make_handler(
+        self, pattern: ResolvedPattern
+    ) -> tuple[Callable[..., Any], bool, Callable[..., Any]]:
         view = self._resolve_view(pattern.view)
         converters = pattern.converters
 
-        def convert_kwargs(values: dict[str, Any]) -> dict[str, Any]:
-            converted: dict[str, Any] = {}
+        def split_kwargs(
+            values: dict[str, Any]
+        ) -> tuple[dict[str, Any], dict[str, Any]]:
+            path_values: dict[str, Any] = {}
+            extra_values: dict[str, Any] = {}
             for name, value in values.items():
                 converter = converters.get(name)
                 if converter is None:
-                    converted[name] = value
+                    extra_values[name] = value
                     continue
                 try:
-                    converted[name] = converter.to_python(value)
+                    path_values[name] = converter.to_python(value)
                 except (TypeError, ValueError) as error:
                     raise Http404(
                         f"No match for {name}={value!r} in URL {pattern.django_path!r}"
                     ) from error
-            return converted
+            return path_values, extra_values
 
-        def call_view(request: HttpRequest, **kwargs: Any) -> Any:
+        def call_view(request: HttpRequest) -> Any:
             values = dict(pattern.kwargs)
             resolver_match = getattr(request, "resolver_match", None)
             if resolver_match is not None:
                 values.update(resolver_match.kwargs)
-            values.update(kwargs)
+            # Typed query/header/body values live outside resolver_match, which
+            # is reserved for the URL-converter kwargs.
+            values.update(getattr(request, "_alpha_kwargs", {}))
             return view(request, **values)
 
         has_middleware = bool(self.middleware)
@@ -264,9 +316,11 @@ class Application:
 
             async def async_handler(raw_request: Any, **kwargs: Any) -> Any:
                 request = HttpRequest(raw_request)
+                path_kwargs, extra_kwargs = split_kwargs(kwargs)
+                request._alpha_kwargs = extra_kwargs  # type: ignore[attr-defined]
                 try:
                     request.resolver_match = SimpleNamespace(  # type: ignore[attr-defined]
-                        kwargs=convert_kwargs(kwargs),
+                        kwargs=path_kwargs,
                         url_name=pattern.name,
                         route=pattern.django_path,
                     )
@@ -288,17 +342,19 @@ class Application:
                 return _ensure_response(response)
 
             async_handler.__alphaapi_async__ = True  # type: ignore[attr-defined]
-            return async_handler, True
+            return async_handler, True, view
 
         def sync_handler(raw_request: Any, **kwargs: Any) -> Any:
             request = HttpRequest(raw_request)
+            path_kwargs, extra_kwargs = split_kwargs(kwargs)
+            request._alpha_kwargs = extra_kwargs  # type: ignore[attr-defined]
             try:
                 request.resolver_match = SimpleNamespace(  # type: ignore[attr-defined]
-                    kwargs=convert_kwargs(kwargs),
+                    kwargs=path_kwargs,
                     url_name=pattern.name,
                     route=pattern.django_path,
                 )
-                return _ensure_response(call_view(request, **request.resolver_match.kwargs))
+                return _ensure_response(call_view(request))
             except Http404 as error:
                 if self._has_exception_handler(type(error)):
                     raise
@@ -308,7 +364,7 @@ class Application:
                     raise
                 return HttpResponseForbidden(str(error) or "Forbidden")
 
-        return sync_handler, False
+        return sync_handler, False, view
 
     def _build_async_chain(self, final: Callable[..., Any]) -> Callable[..., Any]:
         async def get_response(request: HttpRequest) -> Any:
@@ -324,7 +380,12 @@ class Application:
             handler = entry(handler)
         return handler
 
-    def _build_spec(self, pattern: ResolvedPattern, is_async: bool) -> dict[str, Any]:
+    def _build_spec(
+        self,
+        pattern: ResolvedPattern,
+        is_async: bool,
+        view: Callable[..., Any],
+    ) -> dict[str, Any]:
         params: list[dict[str, Any]] = [
             {
                 "name": "request",
@@ -354,6 +415,7 @@ class Application:
                     "positional": False,
                 }
             )
+        params.extend(build_param_specs(view, set(pattern.converters)))
         return {
             "params": params,
             "is_async": is_async,
@@ -366,8 +428,8 @@ class Application:
         self._registered = True
         self._ensure_resolved()
         for pattern in self._resolved:
-            handler, is_async = self._make_handler(pattern)
-            spec = self._build_spec(pattern, is_async)
+            handler, is_async, view = self._make_handler(pattern)
+            spec = self._build_spec(pattern, is_async, view)
             for method in HTTP_METHODS:
                 self._core.add_route(method, pattern.router_path, handler, spec)
 
@@ -377,8 +439,17 @@ class Application:
         self._handlers_registered = True
         self._core.set_http_exception_type(HTTPException)
         for exc_type, handler in self._exception_handlers.items():
-            def wrapped(raw_request: Any, exception: Any, _handler: Any = handler) -> Any:
-                return _handler(HttpRequest(raw_request), exception)
+            if is_async_callable(handler):
+
+                async def wrapped(
+                    raw_request: Any, exception: Any, _handler: Any = handler
+                ) -> Any:
+                    return await _handler(HttpRequest(raw_request), exception)
+
+            else:
+
+                def wrapped(raw_request: Any, exception: Any, _handler: Any = handler) -> Any:
+                    return _handler(HttpRequest(raw_request), exception)
 
             self._core.add_exception_handler(exc_type, wrapped)
 
@@ -402,7 +473,26 @@ class Application:
         if access_log is None:
             access_log = bool(self.settings.ACCESS_LOG)
 
-        self._run_lifecycle(self._startup)
+        config = {
+            "allowed_hosts": [str(item) for item in self.settings.ALLOWED_HOSTS],
+            "trusted_proxies": [str(item) for item in self.settings.TRUSTED_PROXIES],
+            "debug": bool(self.settings.DEBUG),
+            "access_log_json": bool(self.settings.ACCESS_LOG_JSON),
+            "security_headers": bool(self.settings.SECURITY_HEADERS),
+            "hsts_seconds": int(self.settings.SECURE_HSTS_SECONDS or 0),
+            "hsts_include_subdomains": bool(
+                self.settings.SECURE_HSTS_INCLUDE_SUBDOMAINS
+            ),
+            "referrer_policy": str(self.settings.SECURE_REFERRER_POLICY),
+            "x_frame_options": str(self.settings.X_FRAME_OPTIONS),
+            "request_timeout": self.settings.REQUEST_TIMEOUT,
+            "max_concurrent_requests": self.settings.MAX_CONCURRENT_REQUESTS,
+            "offload_sync_views": bool(self.settings.OFFLOAD_SYNC_VIEWS),
+            "http2_max_concurrent_streams": self.settings.HTTP2_MAX_CONCURRENT_STREAMS,
+            "http2_initial_window_size": self.settings.HTTP2_INITIAL_WINDOW_SIZE,
+            "http2_keep_alive_interval": self.settings.HTTP2_KEEP_ALIVE_INTERVAL,
+            "http2_keep_alive_timeout": self.settings.HTTP2_KEEP_ALIVE_TIMEOUT,
+        }
 
         # SIGINT needs special care.  The Rust server installs its own handler
         # while it runs, but there is a window before that where Python's
@@ -423,13 +513,16 @@ class Application:
                     workers=workers,
                     max_body_size=max_body_size,
                     access_log=access_log,
+                    config=config,
                 )
             except BaseException as error:  # re-raised on the calling thread
                 failure.append(error)
 
+        self._core.start_event_loop()
         previous_handler: Any = None
         handler_installed = False
         try:
+            self._run_lifecycle(self._startup)
             if threading.current_thread() is threading.main_thread():
 
                 def _on_sigint(signum: int, frame: Any) -> None:
@@ -457,7 +550,10 @@ class Application:
         finally:
             if handler_installed:
                 signal.signal(signal.SIGINT, previous_handler)
-            self._run_lifecycle(self._shutdown)
+            try:
+                self._run_lifecycle(self._shutdown)
+            finally:
+                self._core.stop_event_loop()
 
         if failure:
             raise failure[0]

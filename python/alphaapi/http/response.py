@@ -6,7 +6,12 @@ hot path (status, headers, body) is still handled by Rust.
 from __future__ import annotations
 
 import json
-from collections.abc import Iterator, MutableMapping
+import mimetypes
+import os
+import shlex
+from collections.abc import AsyncIterable, Iterable, Iterator, MutableMapping
+from email.utils import formatdate, parsedate_to_datetime
+from pathlib import Path
 from typing import Any, Mapping
 
 from .._core import Response, dumps
@@ -106,7 +111,9 @@ class HttpResponse(Response):
         self.status_code = code
         self.headers = headers or {}
         if content_type is None:
-            encoding = charset or "utf-8"
+            from ..conf import settings
+
+            encoding = charset or getattr(settings, "DEFAULT_CHARSET", "utf-8")
             content_type = f"text/html; charset={encoding}"
         self.media_type = content_type
         self.body = b"" if content is None else content
@@ -233,6 +240,236 @@ class JsonResponse(HttpResponse):
         self.body = payload
 
 
+class StreamingHttpResponse(HttpResponse):
+    """A response whose body is produced incrementally.
+
+    ``streaming_content`` may be any sync iterable/iterator or an async
+    iterable/iterator.  Each item must be ``bytes``, ``str``, or a value that
+    can be JSON-encoded by the framework.
+    """
+
+    def __init__(
+        self,
+        streaming_content: Iterable[Any] | AsyncIterable[Any],
+        *,
+        status: int = 200,
+        content_type: str | None = None,
+        headers: Mapping[str, str] | None = None,
+        charset: str | None = None,
+    ) -> None:
+        if callable(streaming_content) and not hasattr(streaming_content, "__iter__"):
+            streaming_content = streaming_content()
+        super().__init__(
+            b"",
+            status=status,
+            content_type=content_type or "text/html; charset=utf-8",
+            headers=headers,
+            charset=charset,
+        )
+        self.streaming_content = streaming_content
+        self.__alphaapi_stream__ = streaming_content
+
+    def __iter__(self) -> Iterator[Any]:
+        if hasattr(self.streaming_content, "__aiter__"):
+            raise TypeError("async streaming responses cannot be iterated synchronously")
+        return iter(self.streaming_content)
+
+
+class FileResponse(StreamingHttpResponse):
+    """Stream a file from disk without loading it into memory.
+
+    When ``request`` is supplied, the response honours ``If-None-Match``,
+    ``If-Modified-Since`` and single-range ``Range`` requests.
+    """
+
+    def __init__(
+        self,
+        path: str | os.PathLike[str],
+        *,
+        status: int = 200,
+        content_type: str | None = None,
+        headers: Mapping[str, str] | None = None,
+        as_attachment: bool = False,
+        filename: str | None = None,
+        chunk_size: int = 64 * 1024,
+        request: Any = None,
+    ) -> None:
+        self.path = Path(path)
+        stat = self.path.stat()
+        self.stat = stat
+        if content_type is None:
+            content_type = mimetypes.guess_type(str(self.path))[0]
+        content_type = content_type or "application/octet-stream"
+
+        etag = f'"{stat.st_size:x}-{int(stat.st_mtime):x}"'
+        last_modified = formatdate(stat.st_mtime, usegmt=True)
+        merged: dict[str, str] = dict(headers or {})
+        merged.setdefault("ETag", etag)
+        merged.setdefault("Last-Modified", last_modified)
+        merged.setdefault("Accept-Ranges", "bytes")
+
+        self._start = 0
+        self._length = stat.st_size
+        no_body = status in {204, 304}
+
+        if request is not None and not no_body:
+            if self._is_not_modified(request, etag, stat.st_mtime):
+                status = 304
+                no_body = True
+                merged.pop("Content-Length", None)
+                self._length = 0
+            else:
+                parsed = self._parse_range(request.headers.get("range", ""), stat.st_size)
+                if parsed == "invalid":
+                    merged.pop("Content-Length", None)
+                    merged["Content-Range"] = f"bytes */{stat.st_size}"
+                    status = 416
+                    no_body = True
+                    self._length = 0
+                elif parsed is not None:
+                    self._start, end = parsed
+                    self._length = end - self._start + 1
+                    status = 206
+                    merged["Content-Range"] = (
+                        f"bytes {self._start}-{end}/{stat.st_size}"
+                    )
+
+        if not no_body:
+            merged.setdefault("Content-Length", str(self._length))
+        if as_attachment:
+            name = filename or self.path.name
+            merged.setdefault(
+                "Content-Disposition",
+                f"attachment; filename={shlex.quote(name)}",
+            )
+
+        super().__init__(
+            self._iter_file(chunk_size),
+            status=status,
+            content_type=content_type,
+            headers=merged,
+        )
+
+    @staticmethod
+    def _is_not_modified(request: Any, etag: str, mtime: float) -> bool:
+        if_none_match = request.headers.get("if-none-match", "")
+        if if_none_match:
+            candidates = [item.strip() for item in if_none_match.split(",")]
+            for candidate in candidates:
+                if candidate == "*" or candidate.removeprefix("W/") == etag:
+                    return True
+            return False
+
+        if_modified_since = request.headers.get("if-modified-since", "")
+        if if_modified_since:
+            try:
+                since = parsedate_to_datetime(if_modified_since).timestamp()
+            except (TypeError, ValueError, OverflowError):
+                return False
+            return int(mtime) <= int(since)
+        return False
+
+    @staticmethod
+    def _parse_range(value: str, size: int) -> tuple[int, int] | None | str:
+        if not value:
+            return None
+        unit, separator, spec = value.partition("=")
+        if not separator or unit.strip().lower() != "bytes":
+            return None
+        # Only the first range is served; multipart ranges are uncommon for
+        # files and rejecting them keeps the implementation small.
+        spec = spec.split(",", 1)[0].strip()
+        start_text, _, end_text = spec.partition("-")
+        try:
+            if not start_text:
+                suffix = int(end_text)
+                if suffix <= 0:
+                    return "invalid"
+                start = max(0, size - suffix)
+                end = size - 1
+            else:
+                start = int(start_text)
+                end = int(end_text) if end_text else size - 1
+        except ValueError:
+            return "invalid"
+
+        if start < 0 or start >= size or start > end:
+            return "invalid"
+        return start, min(end, size - 1)
+
+    def _iter_file(self, chunk_size: int) -> Iterator[bytes]:
+        remaining = self._length
+        with self.path.open("rb") as handle:
+            if self._start:
+                handle.seek(self._start)
+            while remaining > 0:
+                chunk = handle.read(min(chunk_size, remaining))
+                if not chunk:
+                    return
+                remaining -= len(chunk)
+                yield chunk
+
+
+class SseResponse(StreamingHttpResponse):
+    """Server-Sent Events response.
+
+    Iterables may yield plain strings/bytes (sent as-is) or mappings, which are
+    formatted as ``event:``/``id:``/``data:`` fields.
+    """
+
+    def __init__(
+        self,
+        streaming_content: Iterable[Any] | AsyncIterable[Any],
+        *,
+        status: int = 200,
+        headers: Mapping[str, str] | None = None,
+    ) -> None:
+        merged = {
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        }
+        merged.update(headers or {})
+        super().__init__(
+            self._format_iterable(streaming_content),
+            status=status,
+            content_type="text/event-stream; charset=utf-8",
+            headers=merged,
+        )
+
+    @classmethod
+    def _format_chunk(cls, item: Any) -> Any:
+        if isinstance(item, (bytes, str)):
+            return item
+        if isinstance(item, Mapping):
+            lines: list[str] = []
+            if item.get("event") is not None:
+                lines.append(f"event: {item['event']}")
+            if item.get("id") is not None:
+                lines.append(f"id: {item['id']}")
+            data = item.get("data", "")
+            if not isinstance(data, str):
+                data = json.dumps(to_builtin(data), separators=(",", ":"))
+            for line in data.splitlines() or [""]:
+                lines.append(f"data: {line}")
+            return "\n".join(lines) + "\n\n"
+        return f"data: {item}\n\n"
+
+    @classmethod
+    def _format_iterable(
+        cls, source: Iterable[Any] | AsyncIterable[Any]
+    ) -> Any:
+        if hasattr(source, "__aiter__"):
+            async def generator():
+                async for item in source:
+                    yield cls._format_chunk(item)
+            return generator()
+
+        def generator():
+            for item in source:
+                yield cls._format_chunk(item)
+        return generator()
+
+
 class HttpResponseRedirectBase(HttpResponse):
     status_code_default = 302
     allowed_schemes = ("http", "https", "ftp")
@@ -286,9 +523,32 @@ class HttpResponseServerError(HttpResponse):
     status_code_default = 500
 
 
+class HttpResponseConflict(HttpResponse):
+    status_code_default = 409
+
+
+class HttpResponseGone(HttpResponse):
+    status_code_default = 410
+
+
+class HttpResponseTooManyRequests(HttpResponse):
+    status_code_default = 429
+
+
+class HttpResponseServiceUnavailable(HttpResponse):
+    status_code_default = 503
+
+
+class HttpResponseGatewayTimeout(HttpResponse):
+    status_code_default = 504
+
+
 __all__ = [
     "HttpResponse",
     "JsonResponse",
+    "StreamingHttpResponse",
+    "SseResponse",
+    "FileResponse",
     "HttpResponseRedirect",
     "HttpResponsePermanentRedirect",
     "HttpResponseNotModified",
@@ -297,4 +557,9 @@ __all__ = [
     "HttpResponseForbidden",
     "HttpResponseNotAllowed",
     "HttpResponseServerError",
+    "HttpResponseConflict",
+    "HttpResponseGone",
+    "HttpResponseTooManyRequests",
+    "HttpResponseServiceUnavailable",
+    "HttpResponseGatewayTimeout",
 ]

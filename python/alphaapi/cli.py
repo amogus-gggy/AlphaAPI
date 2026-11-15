@@ -120,6 +120,38 @@ def _add_run_options(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _routes(args: argparse.Namespace) -> None:
+    app = load_app(args.app)
+    app._ensure_resolved()
+    print(f"{'METHODS':<28} {'NAME':<24} PATH")
+    for pattern in app._resolved:
+        name = pattern.full_name or ""
+        methods = "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD, TRACE"
+        print(f"{methods:<28} {name:<24} {pattern.django_path or '/'}")
+    print(f"\n{len(app._resolved)} route(s)")
+
+
+def _check(args: argparse.Namespace) -> None:
+    app = load_app(args.app)
+    app._ensure_resolved()
+    app._ensure_registered()
+    app._ensure_exception_handlers()
+
+    problems: list[str] = []
+    allowed = getattr(app.settings, "ALLOWED_HOSTS", ["*"])
+    if not allowed:
+        problems.append("ALLOWED_HOSTS is empty")
+    if not getattr(app.settings, "SECRET_KEY", "") and bool(
+        getattr(app.settings, "DEBUG", False)
+    ):
+        print("warning: SECRET_KEY is empty while DEBUG=True")
+    if problems:
+        for problem in problems:
+            print(f"ERROR: {problem}")
+        raise SystemExit(1)
+    print("System check identified no issues.")
+
+
 def _startproject(args: argparse.Namespace) -> None:
     try:
         root = startproject(args.name, args.directory)
@@ -177,6 +209,18 @@ def main(argv: list[str] | None = None) -> None:
         help="destination directory (defaults to the current directory)",
     )
 
+    for name, help_text in (
+        ("routes", "list resolved URL routes"),
+        ("check", "validate application configuration"),
+    ):
+        app_parser = subparsers.add_parser(name, help=help_text)
+        app_parser.add_argument("app", help="application import path, e.g. project.app:app")
+        app_parser.add_argument(
+            "--settings",
+            default=None,
+            help="settings module, e.g. project.settings",
+        )
+
     args = parser.parse_args(argv)
 
     if args.command == "startproject":
@@ -184,6 +228,14 @@ def main(argv: list[str] | None = None) -> None:
         return
     if args.command == "startapp":
         _startapp(args)
+        return
+    if args.command in {"routes", "check"}:
+        if args.settings:
+            os.environ["ALPHAAPI_SETTINGS_MODULE"] = args.settings
+        if args.command == "routes":
+            _routes(args)
+        else:
+            _check(args)
         return
 
     if args.command in {"runserver", "run"}:

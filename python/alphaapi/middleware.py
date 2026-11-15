@@ -37,4 +37,12 @@ def is_async_callable(value: Any) -> bool:
     return call is not None and inspect.iscoroutinefunction(call)
 
 
-__all__ = ["MiddlewareMixin", "is_async_callable"]
+async def call_next(get_response: Callable[..., Any], request: Any) -> Any:
+    """Invoke ``get_response`` and await the result when necessary."""
+    response = get_response(request)
+    if inspect.isawaitable(response):
+        response = await response
+    return response
+
+
+__all__ = ["MiddlewareMixin", "is_async_callable", "call_next"]

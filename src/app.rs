@@ -1,25 +1,28 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::net::IpAddr;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
-use http::header::{CONTENT_LENGTH, CONTENT_TYPE, SERVER};
+use http::header::{CONTENT_LENGTH, CONTENT_TYPE, HOST, SERVER};
 use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use http_body_util::{BodyExt, Full};
-use hyper::body::{Body as _, Incoming};
+use hyper::body::{Body as _, Frame, Incoming};
 use hyper::service::service_fn;
 use hyper::{Request as HyperRequest, Response as HyperResponse};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
-use pyo3::exceptions::{PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyRuntimeError, PyStopAsyncIteration, PyStopIteration, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyByteArray, PyBytes, PyDict, PyList, PyString, PyTuple};
 use pyo3::IntoPyObjectExt;
 use tokio::net::TcpListener;
-use tokio::sync::Notify;
+use tokio::sync::{mpsc, Notify, Semaphore};
 
 use crate::request::Request;
 use crate::response::Response;
@@ -31,6 +34,8 @@ const METHOD_NOT_ALLOWED_BODY: &[u8] = b"{\"detail\":\"Method Not Allowed\"}";
 const INTERNAL_ERROR_BODY: &[u8] = b"{\"detail\":\"Internal Server Error\"}";
 const PAYLOAD_TOO_LARGE_BODY: &[u8] = b"{\"detail\":\"Request body too large\"}";
 const BAD_REQUEST_BODY: &[u8] = b"{\"detail\":\"Bad Request\"}";
+const SERVICE_UNAVAILABLE_BODY: &[u8] = b"{\"detail\":\"Service Unavailable\"}";
+const GATEWAY_TIMEOUT_BODY: &[u8] = b"{\"detail\":\"Gateway Timeout\"}";
 
 // ---------------------------------------------------------------------------
 // Python asyncio bridge
@@ -106,6 +111,120 @@ struct RouteDef {
     spec: RouteSpec,
 }
 
+#[derive(Clone)]
+struct ServerConfig {
+    allowed_hosts: Vec<String>,
+    trusted_proxies: Vec<String>,
+    debug: bool,
+    access_log_json: bool,
+    security_headers: bool,
+    hsts_seconds: u64,
+    hsts_include_subdomains: bool,
+    referrer_policy: String,
+    x_frame_options: String,
+    request_timeout: Option<Duration>,
+    max_concurrent_requests: Option<usize>,
+    offload_sync_views: bool,
+    http2_max_concurrent_streams: Option<u32>,
+    http2_initial_window_size: Option<u32>,
+    http2_keep_alive_interval: Option<Duration>,
+    http2_keep_alive_timeout: Option<Duration>,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            allowed_hosts: vec!["*".to_string()],
+            trusted_proxies: Vec::new(),
+            debug: false,
+            access_log_json: false,
+            security_headers: true,
+            hsts_seconds: 0,
+            hsts_include_subdomains: false,
+            referrer_policy: "same-origin".to_string(),
+            x_frame_options: "DENY".to_string(),
+            request_timeout: None,
+            max_concurrent_requests: None,
+            offload_sync_views: false,
+            http2_max_concurrent_streams: None,
+            http2_initial_window_size: None,
+            http2_keep_alive_interval: None,
+            http2_keep_alive_timeout: None,
+        }
+    }
+}
+
+fn config_bool(dict: &Bound<'_, PyDict>, key: &str, default: bool) -> PyResult<bool> {
+    match dict.get_item(key)? {
+        Some(value) if !value.is_none() => value.extract(),
+        _ => Ok(default),
+    }
+}
+
+fn config_int<T>(dict: &Bound<'_, PyDict>, key: &str) -> PyResult<Option<T>>
+where
+    T: for<'a, 'py> pyo3::FromPyObject<'a, 'py>,
+{
+    match dict.get_item(key)? {
+        Some(value) if !value.is_none() => Ok(Some(value.extract().map_err(Into::into)?)),
+        _ => Ok(None),
+    }
+}
+
+fn config_string(dict: &Bound<'_, PyDict>, key: &str, default: &str) -> PyResult<String> {
+    match dict.get_item(key)? {
+        Some(value) if !value.is_none() => value.extract(),
+        _ => Ok(default.to_string()),
+    }
+}
+
+fn config_strings(
+    dict: &Bound<'_, PyDict>,
+    key: &str,
+    default: Vec<String>,
+) -> PyResult<Vec<String>> {
+    match dict.get_item(key)? {
+        Some(value) if !value.is_none() => value.extract(),
+        _ => Ok(default),
+    }
+}
+
+impl ServerConfig {
+    fn from_py(dict: Option<&Bound<'_, PyDict>>) -> PyResult<Self> {
+        let Some(dict) = dict else {
+            return Ok(Self::default());
+        };
+        let timeout: Option<f64> = config_int(dict, "request_timeout")?;
+        let keep_alive_interval: Option<f64> = config_int(dict, "http2_keep_alive_interval")?;
+        let keep_alive_timeout: Option<f64> = config_int(dict, "http2_keep_alive_timeout")?;
+
+        Ok(Self {
+            allowed_hosts: config_strings(dict, "allowed_hosts", vec!["*".to_string()])?,
+            trusted_proxies: config_strings(dict, "trusted_proxies", Vec::new())?,
+            debug: config_bool(dict, "debug", false)?,
+            access_log_json: config_bool(dict, "access_log_json", false)?,
+            security_headers: config_bool(dict, "security_headers", true)?,
+            hsts_seconds: config_int::<u64>(dict, "hsts_seconds")?.unwrap_or(0),
+            hsts_include_subdomains: config_bool(dict, "hsts_include_subdomains", false)?,
+            referrer_policy: config_string(dict, "referrer_policy", "same-origin")?,
+            x_frame_options: config_string(dict, "x_frame_options", "DENY")?,
+            request_timeout: timeout
+                .filter(|value| *value > 0.0)
+                .map(Duration::from_secs_f64),
+            max_concurrent_requests: config_int::<usize>(dict, "max_concurrent_requests")?,
+            offload_sync_views: config_bool(dict, "offload_sync_views", false)?,
+            http2_max_concurrent_streams: config_int::<u32>(dict, "http2_max_concurrent_streams")?,
+            http2_initial_window_size: config_int::<u32>(dict, "http2_initial_window_size")?,
+            http2_keep_alive_interval: keep_alive_interval
+                .filter(|value| *value > 0.0)
+                .map(Duration::from_secs_f64),
+            http2_keep_alive_timeout: keep_alive_timeout
+                .filter(|value| *value > 0.0)
+                .map(Duration::from_secs_f64),
+        })
+    }
+}
+
 struct ServerState {
     routes: Vec<RouteDef>,
     paths: Vec<HashMap<Method, usize>>,
@@ -115,6 +234,8 @@ struct ServerState {
     max_body_size: usize,
     access_log: bool,
     event_loop: Option<Arc<PyLoop>>,
+    config: ServerConfig,
+    semaphore: Option<Arc<Semaphore>>,
 }
 
 #[pyclass(module = "alphaapi._core")]
@@ -124,6 +245,7 @@ pub struct AppCore {
     http_exception_type: Option<Py<PyAny>>,
     shutdown: Arc<Notify>,
     running: Arc<AtomicBool>,
+    event_loop: Mutex<Option<Arc<PyLoop>>>,
 }
 
 #[pymethods]
@@ -136,6 +258,7 @@ impl AppCore {
             http_exception_type: None,
             shutdown: Arc::new(Notify::new()),
             running: Arc::new(AtomicBool::new(false)),
+            event_loop: Mutex::new(None),
         }
     }
 
@@ -185,7 +308,44 @@ impl AppCore {
         self.running.load(Ordering::SeqCst)
     }
 
-    #[pyo3(signature = (host = "127.0.0.1", port = 8000, workers = None, max_body_size = None, access_log = None))]
+    fn start_event_loop(&self, py: Python<'_>) -> PyResult<()> {
+        let mut slot = self.event_loop.lock().unwrap();
+        if slot.is_none() {
+            *slot = Some(PyLoop::start(py)?);
+        }
+        Ok(())
+    }
+
+    fn stop_event_loop(&self, py: Python<'_>) {
+        let event_loop = self.event_loop.lock().unwrap().take();
+        if let Some(event_loop) = event_loop {
+            event_loop.stop();
+            // The loop thread needs the GIL to finish *after* ``stop`` is
+            // scheduled, so releasing it while joining avoids a deadlock.
+            py.detach(|| event_loop.join());
+        }
+    }
+
+    fn run_on_event_loop(
+        &self,
+        py: Python<'_>,
+        awaitable: &Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        let event_loop = self
+            .event_loop
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| PyRuntimeError::new_err("event loop is not running"))?;
+        let asyncio = py.import("asyncio")?;
+        let future = asyncio.call_method1(
+            "run_coroutine_threadsafe",
+            (awaitable, event_loop.loop_obj.bind(py)),
+        )?;
+        Ok(future.call_method0("result")?.unbind())
+    }
+
+    #[pyo3(signature = (host = "127.0.0.1", port = 8000, workers = None, max_body_size = None, access_log = None, config = None))]
     fn run(
         &self,
         py: Python<'_>,
@@ -194,6 +354,7 @@ impl AppCore {
         workers: Option<usize>,
         max_body_size: Option<usize>,
         access_log: Option<bool>,
+        config: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<()> {
         if self
             .running
@@ -203,6 +364,13 @@ impl AppCore {
             return Err(PyRuntimeError::new_err("server is already running"));
         }
 
+        let server_config = match ServerConfig::from_py(config) {
+            Ok(config) => config,
+            Err(error) => {
+                self.running.store(false, Ordering::SeqCst);
+                return Err(error);
+            }
+        };
         let result = self.run_inner(
             py,
             host,
@@ -210,6 +378,7 @@ impl AppCore {
             workers,
             max_body_size.unwrap_or(16 * 1024 * 1024),
             access_log.unwrap_or(false),
+            server_config,
         );
         self.running.store(false, Ordering::SeqCst);
         result
@@ -225,6 +394,7 @@ impl AppCore {
         workers: Option<usize>,
         max_body_size: usize,
         access_log: bool,
+        config: ServerConfig,
     ) -> PyResult<()> {
         // Build the matchit router.
         let mut router: matchit::Router<usize> = matchit::Router::new();
@@ -250,10 +420,13 @@ impl AppCore {
             paths[path_id].insert(route.method.clone(), index);
         }
 
-        let event_loop = if self.routes.iter().any(|route| route.spec.is_async) {
-            Some(PyLoop::start(py)?)
-        } else {
-            None
+        // The bridge is also used for streaming responses, async exception
+        // handlers, and lifecycle hooks, so start it whenever one was not
+        // already supplied by the Python layer.
+        let existing_loop = self.event_loop.lock().unwrap().clone();
+        let (event_loop, owns_event_loop) = match existing_loop {
+            Some(event_loop) => (event_loop, false),
+            None => (PyLoop::start(py)?, true),
         };
 
         // Clone Python references while the GIL is held.
@@ -309,7 +482,12 @@ impl AppCore {
             http_exception_type,
             max_body_size,
             access_log,
-            event_loop: event_loop.clone(),
+            event_loop: Some(event_loop.clone()),
+            semaphore: config
+                .max_concurrent_requests
+                .filter(|limit| *limit > 0)
+                .map(|limit| Arc::new(Semaphore::new(limit))),
+            config,
         });
 
         // Python execution is serialized by the GIL, so extra Tokio workers
@@ -335,7 +513,7 @@ impl AppCore {
         let server_result =
             py.detach(move || runtime.block_on(serve(serve_state, shutdown, address)));
 
-        if let Some(event_loop) = &event_loop {
+        if owns_event_loop {
             event_loop.stop();
             py.detach(|| event_loop.join());
         }
@@ -375,12 +553,42 @@ async fn serve(
                 let client = peer.ip();
 
                 tokio::spawn(async move {
+                    let builder_state = state.clone();
                     let service = service_fn(move |request: HyperRequest<Incoming>| {
                         let state = state.clone();
                         async move {
-                            Ok::<_, std::convert::Infallible>(
-                                handle_request(request, state, client).await,
-                            )
+                            let permit = if let Some(semaphore) = &state.semaphore {
+                                match semaphore.clone().try_acquire_owned() {
+                                    Ok(permit) => Some(permit),
+                                    Err(_) => {
+                                        return Ok::<_, Infallible>(
+                                            BuiltResponse::static_json(
+                                                StatusCode::SERVICE_UNAVAILABLE,
+                                                SERVICE_UNAVAILABLE_BODY,
+                                            )
+                                            .into_hyper(false),
+                                        )
+                                    }
+                                }
+                            } else {
+                                None
+                            };
+                            let _permit = permit;
+
+                            let future = handle_request(request, state.clone(), client);
+                            let response = if let Some(timeout) = state.config.request_timeout {
+                                match tokio::time::timeout(timeout, future).await {
+                                    Ok(response) => response,
+                                    Err(_) => BuiltResponse::static_json(
+                                        StatusCode::GATEWAY_TIMEOUT,
+                                        GATEWAY_TIMEOUT_BODY,
+                                    )
+                                    .into_hyper(false),
+                                }
+                            } else {
+                                future.await
+                            };
+                            Ok::<_, Infallible>(response)
                         }
                     });
                     // Detect HTTP/1 vs HTTP/2 (cleartext, prior knowledge)
@@ -391,6 +599,30 @@ async fn serve(
                         .http1()
                         .keep_alive(true)
                         .pipeline_flush(true);
+                    {
+                        let mut http2 = builder.http2();
+                        if let Some(value) =
+                            builder_state.config.http2_max_concurrent_streams
+                        {
+                            http2.max_concurrent_streams(value);
+                        }
+                        if let Some(value) =
+                            builder_state.config.http2_initial_window_size
+                        {
+                            http2.initial_stream_window_size(value);
+                            http2.initial_connection_window_size(value);
+                        }
+                        if let Some(value) =
+                            builder_state.config.http2_keep_alive_interval
+                        {
+                            http2.keep_alive_interval(value);
+                        }
+                        if let Some(value) =
+                            builder_state.config.http2_keep_alive_timeout
+                        {
+                            http2.keep_alive_timeout(value);
+                        }
+                    }
                     let _ = builder.serve_connection(io, service).await;
                 });
             }
@@ -400,11 +632,68 @@ async fn serve(
     Ok(())
 }
 
+struct ChannelBody {
+    receiver: mpsc::Receiver<Result<Bytes, std::io::Error>>,
+}
+
+impl hyper::body::Body for ChannelBody {
+    type Data = Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        match self.get_mut().receiver.poll_recv(cx) {
+            Poll::Ready(Some(Ok(data))) => Poll::Ready(Some(Ok(Frame::data(data)))),
+            Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(error))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+enum ResponseBody {
+    Full(Full<Bytes>),
+    Channel(ChannelBody),
+}
+
+impl hyper::body::Body for ResponseBody {
+    type Data = Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        match self.get_mut() {
+            ResponseBody::Full(body) => Pin::new(body)
+                .poll_frame(cx)
+                .map_err(|never| match never {}),
+            ResponseBody::Channel(body) => Pin::new(body).poll_frame(cx),
+        }
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        match self {
+            ResponseBody::Full(body) => body.size_hint(),
+            ResponseBody::Channel(_) => hyper::body::SizeHint::default(),
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        match self {
+            ResponseBody::Full(body) => body.is_end_stream(),
+            ResponseBody::Channel(_) => false,
+        }
+    }
+}
+
 async fn handle_request(
     request: HyperRequest<Incoming>,
     state: Arc<ServerState>,
     client: IpAddr,
-) -> HyperResponse<Full<Bytes>> {
+) -> HyperResponse<ResponseBody> {
     let started = Instant::now();
     let (parts, incoming) = request.into_parts();
     let method = parts.method;
@@ -415,6 +704,16 @@ async fn handle_request(
     } else {
         None
     };
+
+    let host = parts
+        .headers
+        .get(HOST)
+        .and_then(|value| value.to_str().ok());
+    if !host_allowed(host, &state.config.allowed_hosts) {
+        return BuiltResponse::static_json(StatusCode::BAD_REQUEST, BAD_REQUEST_BODY)
+            .into_hyper(false);
+    }
+    let client = effective_client(client, &parts.headers, &state.config.trusted_proxies);
 
     // Route first, so we know exactly which request data the handler needs.
     let matched = match state.router.at(path) {
@@ -451,6 +750,7 @@ async fn handle_request(
     let full_request = spec.needs_request || has_handlers;
     let needs_headers = full_request || spec.has_header_params;
     let needs_query = full_request || spec.has_query_params;
+    let needs_body = full_request || spec.has_body;
 
     let params = if (spec.has_path_params || full_request) && !matched.params.is_empty() {
         let mut params = Vec::with_capacity(matched.params.len());
@@ -462,6 +762,24 @@ async fn handle_request(
         Vec::new()
     };
 
+    // Reject oversized payloads from Content-Length without reading a frame.
+    if needs_body {
+        if let Some(length) = parts
+            .headers
+            .get(CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+        {
+            if length > state.max_body_size as u64 {
+                return BuiltResponse::static_json(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    PAYLOAD_TOO_LARGE_BODY,
+                )
+                .into_hyper(false);
+            }
+        }
+    }
+
     // Only materialize the pieces the route actually asked for.
     let path_string = full_request.then(|| path.to_string());
     let query_string = full_request.then(|| query.to_string());
@@ -472,7 +790,21 @@ async fn handle_request(
         None
     };
 
-    let body = if incoming.is_end_stream() {
+    let body = if !needs_body {
+        // Drain in the background so the connection can be reused, but avoid
+        // buffering data that no view or exception handler will inspect.
+        if !incoming.is_end_stream() {
+            tokio::spawn(async move {
+                let mut incoming = incoming;
+                while let Some(frame) = incoming.frame().await {
+                    if frame.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        Bytes::new()
+    } else if incoming.is_end_stream() {
         Bytes::new()
     } else {
         match read_body(incoming, state.max_body_size).await {
@@ -503,19 +835,95 @@ async fn handle_request(
     };
 
     let is_head = method == Method::HEAD;
-    let built = dispatch(state.clone(), route_index, request_data).await;
+    let mut built = dispatch(state.clone(), route_index, request_data).await;
+    apply_security_headers(&mut built, &state.config);
     let status = built.status;
     let response = built.into_hyper(is_head);
     if state.access_log {
-        eprintln!(
-            "{} {} {} {:.2}ms",
-            method,
-            log_path.as_deref().unwrap_or(""),
-            status.as_u16(),
-            started.elapsed().as_secs_f64() * 1000.0
-        );
+        let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+        if state.config.access_log_json {
+            eprintln!(
+                "{{\"method\":\"{}\",\"path\":\"{}\",\"status\":{},\"duration_ms\":{:.2}}}",
+                method,
+                escape_log(log_path.as_deref().unwrap_or("")),
+                status.as_u16(),
+                elapsed
+            );
+        } else {
+            eprintln!(
+                "{} {} {} {:.2}ms",
+                method,
+                log_path.as_deref().unwrap_or(""),
+                status.as_u16(),
+                elapsed
+            );
+        }
     }
     response
+}
+
+fn host_allowed(host: Option<&str>, allowed_hosts: &[String]) -> bool {
+    if allowed_hosts.iter().any(|pattern| pattern == "*") {
+        return true;
+    }
+    let Some(host) = host else {
+        return false;
+    };
+    let hostname = host
+        .rsplit_once(':')
+        .map(|(name, _)| name)
+        .unwrap_or(host)
+        .trim_matches(['[', ']'])
+        .to_ascii_lowercase();
+    allowed_hosts.iter().any(|pattern| {
+        let pattern = pattern.to_ascii_lowercase();
+        if let Some(suffix) = pattern.strip_prefix('.') {
+            hostname == suffix || hostname.ends_with(&pattern)
+        } else {
+            hostname == pattern
+        }
+    })
+}
+
+fn effective_client(client: IpAddr, headers: &HeaderMap, trusted_proxies: &[String]) -> IpAddr {
+    let trusted = trusted_proxies.iter().any(|proxy| {
+        proxy == "*"
+            || proxy
+                .parse::<IpAddr>()
+                .map(|ip| ip == client)
+                .unwrap_or(false)
+    });
+    if trusted {
+        if let Some(forwarded) = headers
+            .get("x-forwarded-for")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(',').next())
+            .and_then(|value| value.trim().parse::<IpAddr>().ok())
+        {
+            return forwarded;
+        }
+    }
+    client
+}
+
+fn apply_security_headers(response: &mut BuiltResponse, config: &ServerConfig) {
+    if !config.security_headers {
+        return;
+    }
+    response.add_header_if_missing("x-content-type-options", "nosniff");
+    response.add_header_if_missing("x-frame-options", &config.x_frame_options);
+    response.add_header_if_missing("referrer-policy", &config.referrer_policy);
+    if config.hsts_seconds > 0 {
+        let mut value = format!("max-age={}", config.hsts_seconds);
+        if config.hsts_include_subdomains {
+            value.push_str("; includeSubDomains");
+        }
+        response.add_header_if_missing("strict-transport-security", &value);
+    }
+}
+
+fn escape_log(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 enum BodyError {
@@ -572,7 +980,7 @@ async fn read_body(mut body: Incoming, max_size: usize) -> Result<Bytes, BodyErr
     })
 }
 
-fn method_not_allowed(methods: &HashMap<Method, usize>) -> HyperResponse<Full<Bytes>> {
+fn method_not_allowed(methods: &HashMap<Method, usize>) -> HyperResponse<ResponseBody> {
     let allow = allow_header(methods);
     BuiltResponse::static_json(StatusCode::METHOD_NOT_ALLOWED, METHOD_NOT_ALLOWED_BODY)
         .with_header("allow", allow)
@@ -611,6 +1019,7 @@ fn parse_query(query: &str) -> HashMap<String, Vec<String>> {
 // Dispatch
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 struct RequestData {
     method: Method,
     path: Option<String>,
@@ -699,26 +1108,54 @@ async fn dispatch(
     request: RequestData,
 ) -> BuiltResponse {
     if state.routes[route_index].spec.is_async {
-        dispatch_async(state, route_index, request).await
-    } else {
-        // Run short synchronous handlers directly on the current worker.  The
-        // GIL serializes Python execution anyway, so a thread-pool round-trip
-        // only adds latency.
-        Python::attach(|py| dispatch_blocking(py, &state, route_index, &request))
+        return dispatch_async(state, route_index, request).await;
     }
+
+    if state.config.offload_sync_views {
+        let task_state = state.clone();
+        let handle = tokio::task::spawn_blocking(move || {
+            let result =
+                Python::attach(|py| call_handler(py, &task_state.routes[route_index], &request));
+            match result {
+                Ok(value) => Ok(Python::attach(|py| {
+                    let status = task_state.routes[route_index].spec.status_code;
+                    serialize_result(py, value, status, task_state.event_loop.as_ref())
+                })),
+                Err(CallError::Validation(failure)) => Ok(validation_response(failure)),
+                Err(CallError::Python(error)) => Err((error, request)),
+            }
+        })
+        .await;
+
+        return match handle {
+            Ok(Ok(response)) => response,
+            Ok(Err((error, request))) => handle_python_error(&state, error, &request).await,
+            Err(error) => {
+                eprintln!("handler task failed: {error}");
+                BuiltResponse::static_json(StatusCode::INTERNAL_SERVER_ERROR, INTERNAL_ERROR_BODY)
+            }
+        };
+    }
+
+    // Run short synchronous handlers directly on the current worker.  The GIL
+    // serializes Python execution anyway, so a thread-pool round-trip only adds
+    // latency unless the application opts into offloading.
+    dispatch_sync(&state, route_index, &request).await
 }
 
-fn dispatch_blocking(
-    py: Python<'_>,
-    state: &ServerState,
+async fn dispatch_sync(
+    state: &Arc<ServerState>,
     route_index: usize,
     request: &RequestData,
 ) -> BuiltResponse {
-    let route = &state.routes[route_index];
-    match call_handler(py, route, request) {
-        Ok(value) => serialize_result(py, value, route.spec.status_code),
+    let status = state.routes[route_index].spec.status_code;
+    let result = Python::attach(|py| call_handler(py, &state.routes[route_index], request));
+    match result {
+        Ok(value) => {
+            Python::attach(|py| serialize_result(py, value, status, state.event_loop.as_ref()))
+        }
         Err(CallError::Validation(failure)) => validation_response(failure),
-        Err(CallError::Python(error)) => handle_python_error(py, state, error, request),
+        Err(CallError::Python(error)) => handle_python_error(state, error, request).await,
     }
 }
 
@@ -729,14 +1166,13 @@ async fn dispatch_async(
 ) -> BuiltResponse {
     // Calling an `async def` handler only creates a coroutine, so it is cheap
     // enough to do inline instead of paying for a blocking-pool round-trip.
-    let awaitable =
-        match Python::attach(|py| call_handler(py, &state.routes[route_index], &request)) {
-            Ok(awaitable) => awaitable,
-            Err(CallError::Validation(failure)) => return validation_response(failure),
-            Err(CallError::Python(error)) => {
-                return Python::attach(|py| handle_python_error(py, &state, error, &request))
-            }
-        };
+    let awaitable = match Python::attach(|py| {
+        call_handler(py, &state.routes[route_index], &request)
+    }) {
+        Ok(awaitable) => awaitable,
+        Err(CallError::Validation(failure)) => return validation_response(failure),
+        Err(CallError::Python(error)) => return handle_python_error(&state, error, &request).await,
+    };
 
     let event_loop = match &state.event_loop {
         Some(event_loop) => event_loop.clone(),
@@ -750,15 +1186,15 @@ async fn dispatch_async(
 
     let future = match Python::attach(|py| event_loop.future(awaitable.bind(py).clone())) {
         Ok(future) => future,
-        Err(error) => return Python::attach(|py| handle_python_error(py, &state, error, &request)),
+        Err(error) => return handle_python_error(&state, error, &request).await,
     };
 
     match future.await {
         Ok(value) => Python::attach(|py| {
             let status = state.routes[route_index].spec.status_code;
-            serialize_result(py, value, status)
+            serialize_result(py, value, status, state.event_loop.as_ref())
         }),
-        Err(error) => Python::attach(|py| handle_python_error(py, &state, error, &request)),
+        Err(error) => handle_python_error(&state, error, &request).await,
     }
 }
 
@@ -1006,8 +1442,7 @@ fn validation_response(failure: ValidationFailure) -> BuiltResponse {
     )
 }
 
-fn handle_python_error(
-    py: Python<'_>,
+async fn handle_python_error(
     state: &ServerState,
     error: PyErr,
     request: &RequestData,
@@ -1015,71 +1450,181 @@ fn handle_python_error(
     // User supplied exception handlers take precedence so applications can
     // override the built-in HTTPException rendering.
     for (exc_type, handler) in &state.exception_handlers {
-        if error.is_instance(py, exc_type.bind(py)) {
+        let call = Python::attach(|py| -> Option<Result<Py<PyAny>, PyErr>> {
+            if !error.is_instance(py, exc_type.bind(py)) {
+                return None;
+            }
             let request_object = match Py::new(py, request.to_request()) {
                 Ok(request) => request.into_any(),
-                Err(inner) => {
-                    inner.print(py);
+                Err(inner) => return Some(Err(inner)),
+            };
+            let exception = error.value(py).clone().into_any().unbind();
+            Some(handler.call1(py, (request_object, exception)))
+        });
+
+        let value = match call {
+            None => continue,
+            Some(Ok(value)) => value,
+            Some(Err(handler_error)) => {
+                Python::attach(|py| handler_error.print(py));
+                break;
+            }
+        };
+
+        let is_awaitable = Python::attach(|py| -> PyResult<bool> {
+            let inspect = py.import("inspect")?;
+            inspect
+                .call_method1("isawaitable", (value.bind(py),))?
+                .is_truthy()
+        })
+        .unwrap_or(false);
+
+        let result = if is_awaitable {
+            let event_loop = match &state.event_loop {
+                Some(event_loop) => event_loop.clone(),
+                None => {
+                    return BuiltResponse::static_json(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        INTERNAL_ERROR_BODY,
+                    )
+                }
+            };
+            let future = match Python::attach(|py| event_loop.future(value.bind(py).clone())) {
+                Ok(future) => future,
+                Err(handler_error) => {
+                    Python::attach(|py| handler_error.print(py));
                     break;
                 }
             };
-            let exception = error.value(py).clone().into_any().unbind();
-            match handler.call1(py, (request_object, exception)) {
-                Ok(value) => return serialize_result(py, value, 200),
-                Err(handler_error) => {
-                    handler_error.print(py);
-                    break;
-                }
+            future.await
+        } else {
+            Ok(value)
+        };
+
+        match result {
+            Ok(value) => {
+                return Python::attach(|py| {
+                    serialize_result(py, value, 200, state.event_loop.as_ref())
+                })
+            }
+            Err(handler_error) => {
+                Python::attach(|py| handler_error.print(py));
+                break;
             }
         }
     }
 
     // Built-in HTTPException support.
-    if let Some(exc_type) = &state.http_exception_type {
-        if error.is_instance(py, exc_type.bind(py)) {
-            let value = error.value(py);
-            let status = value
-                .getattr("status_code")
-                .ok()
-                .and_then(|status| status.extract::<u16>().ok())
-                .unwrap_or(500);
-            let detail = value
-                .getattr("detail")
-                .ok()
-                .and_then(|detail| json_bytes(py, &detail).ok())
-                .unwrap_or_else(|| b"null".to_vec());
-            let mut body = Vec::with_capacity(detail.len() + 11);
-            body.extend_from_slice(b"{\"detail\":");
-            body.extend_from_slice(&detail);
-            body.push(b'}');
+    let mut builtin = None;
+    Python::attach(|py| {
+        if let Some(exc_type) = &state.http_exception_type {
+            if error.is_instance(py, exc_type.bind(py)) {
+                let value = error.value(py);
+                let status = value
+                    .getattr("status_code")
+                    .ok()
+                    .and_then(|status| status.extract::<u16>().ok())
+                    .unwrap_or(500);
+                let detail = value
+                    .getattr("detail")
+                    .ok()
+                    .and_then(|detail| json_bytes(py, &detail).ok())
+                    .unwrap_or_else(|| b"null".to_vec());
+                let mut body = Vec::with_capacity(detail.len() + 11);
+                body.extend_from_slice(b"{\"detail\":");
+                body.extend_from_slice(&detail);
+                body.push(b'}');
 
-            let mut headers = Vec::new();
-            if let Ok(header_dict) = value.getattr("headers") {
-                if let Ok(header_dict) = header_dict.cast::<PyDict>() {
-                    for (key, value) in header_dict.iter() {
-                        if let (Ok(key), Ok(value)) =
-                            (key.extract::<String>(), value.extract::<String>())
-                        {
-                            headers.push((key, value));
+                let mut headers = Vec::new();
+                if let Ok(header_dict) = value.getattr("headers") {
+                    if let Ok(header_dict) = header_dict.cast::<PyDict>() {
+                        for (key, value) in header_dict.iter() {
+                            if let (Ok(key), Ok(value)) =
+                                (key.extract::<String>(), value.extract::<String>())
+                            {
+                                headers.push((key, value));
+                            }
                         }
                     }
                 }
-            }
 
-            return BuiltResponse::json_vec(
-                StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-                body,
-                headers,
-            );
+                builtin = Some(BuiltResponse::json_vec(
+                    StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                    body,
+                    headers,
+                ));
+            }
         }
+    });
+    if let Some(response) = builtin {
+        return response;
     }
 
-    error.print(py);
-    BuiltResponse::static_json(StatusCode::INTERNAL_SERVER_ERROR, INTERNAL_ERROR_BODY)
+    Python::attach(|py| {
+        if state.config.debug {
+            if let Ok(module) = py.import("alphaapi._debug") {
+                if let Ok(html) = module.call_method1("format_exception", (error.value(py),)) {
+                    if let Ok(text) = html.extract::<String>() {
+                        return BuiltResponse {
+                            status: StatusCode::INTERNAL_SERVER_ERROR,
+                            headers: Vec::new(),
+                            body: Bytes::from(text.into_bytes()),
+                            stream: None,
+                            media_type: Some(Cow::Borrowed("text/html; charset=utf-8")),
+                        };
+                    }
+                }
+            }
+        }
+        error.print(py);
+        BuiltResponse::static_json(StatusCode::INTERNAL_SERVER_ERROR, INTERNAL_ERROR_BODY)
+    })
 }
 
-fn serialize_result(py: Python<'_>, value: Py<PyAny>, default_status: u16) -> BuiltResponse {
+fn serialize_result(
+    py: Python<'_>,
+    value: Py<PyAny>,
+    default_status: u16,
+    event_loop: Option<&Arc<PyLoop>>,
+) -> BuiltResponse {
     let value = value.bind(py);
+
+    if let Ok(stream) = value.getattr("__alphaapi_stream__") {
+        if !stream.is_none() {
+            let response = Response::from_instance(value);
+            let (status, headers, media_type) = match response {
+                Some(response) => (
+                    StatusCode::from_u16(response.status_code)
+                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                    response.headers,
+                    response.media_type.map(Cow::Owned),
+                ),
+                None => (
+                    StatusCode::from_u16(default_status).unwrap_or(StatusCode::OK),
+                    Vec::new(),
+                    None,
+                ),
+            };
+            match build_python_stream(py, &stream, event_loop.cloned()) {
+                Ok(channel) => {
+                    return BuiltResponse {
+                        status,
+                        headers,
+                        body: Bytes::new(),
+                        stream: Some(channel),
+                        media_type,
+                    }
+                }
+                Err(error) => {
+                    error.print(py);
+                    return BuiltResponse::static_json(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        INTERNAL_ERROR_BODY,
+                    );
+                }
+            }
+        }
+    }
 
     if let Some(response) = Response::from_instance(value) {
         let status =
@@ -1088,6 +1633,7 @@ fn serialize_result(py: Python<'_>, value: Py<PyAny>, default_status: u16) -> Bu
             status,
             headers: response.headers,
             body: Bytes::from(response.body),
+            stream: None,
             media_type: response.media_type.map(Cow::Owned),
         };
     }
@@ -1105,6 +1651,7 @@ fn serialize_result(py: Python<'_>, value: Py<PyAny>, default_status: u16) -> Bu
             status: StatusCode::from_u16(default_status).unwrap_or(StatusCode::OK),
             headers: Vec::new(),
             body: Bytes::copy_from_slice(bytes.as_bytes()),
+            stream: None,
             media_type: Some(Cow::Borrowed("application/octet-stream")),
         };
     }
@@ -1114,6 +1661,7 @@ fn serialize_result(py: Python<'_>, value: Py<PyAny>, default_status: u16) -> Bu
             status: StatusCode::from_u16(default_status).unwrap_or(StatusCode::OK),
             headers: Vec::new(),
             body: Bytes::from(bytes.to_vec()),
+            stream: None,
             media_type: Some(Cow::Borrowed("application/octet-stream")),
         };
     }
@@ -1123,6 +1671,7 @@ fn serialize_result(py: Python<'_>, value: Py<PyAny>, default_status: u16) -> Bu
             status: StatusCode::from_u16(default_status).unwrap_or(StatusCode::OK),
             headers: Vec::new(),
             body: Bytes::from(text.to_string_lossy().into_owned().into_bytes()),
+            stream: None,
             media_type: Some(Cow::Borrowed("text/plain; charset=utf-8")),
         };
     }
@@ -1140,6 +1689,154 @@ fn serialize_result(py: Python<'_>, value: Py<PyAny>, default_status: u16) -> Bu
     }
 }
 
+fn stream_item_bytes(py: Python<'_>, item: &Bound<'_, PyAny>) -> PyResult<Bytes> {
+    if let Ok(bytes) = item.cast::<PyBytes>() {
+        return Ok(Bytes::copy_from_slice(bytes.as_bytes()));
+    }
+    if let Ok(text) = item.cast::<PyString>() {
+        return Ok(Bytes::from(
+            text.to_string_lossy().into_owned().into_bytes(),
+        ));
+    }
+    Ok(Bytes::from(crate::util::content_to_bytes(py, item)?))
+}
+
+fn build_python_stream(
+    _py: Python<'_>,
+    value: &Bound<'_, PyAny>,
+    event_loop: Option<Arc<PyLoop>>,
+) -> PyResult<ChannelBody> {
+    let (sender, receiver) = mpsc::channel(8);
+
+    if value.hasattr("__aiter__")? {
+        let iterator = value.call_method0("__aiter__")?.unbind();
+        let event_loop = event_loop.ok_or_else(|| {
+            PyRuntimeError::new_err("async streaming requires the asyncio bridge")
+        })?;
+
+        enum Step {
+            Awaitable(Py<PyAny>),
+            Stop,
+            Error(String),
+        }
+
+        tokio::spawn(async move {
+            loop {
+                // Bound Python objects stay inside `attach`; only owned,
+                // `Send` handles cross the await points below.
+                let step = Python::attach(|py| match iterator.bind(py).call_method0("__anext__") {
+                    Ok(awaitable) => Step::Awaitable(awaitable.unbind()),
+                    Err(error) => {
+                        if error.is_instance_of::<PyStopAsyncIteration>(py) {
+                            Step::Stop
+                        } else {
+                            Step::Error(error.to_string())
+                        }
+                    }
+                });
+
+                let awaitable = match step {
+                    Step::Awaitable(awaitable) => awaitable,
+                    Step::Stop => break,
+                    Step::Error(message) => {
+                        let _ = sender.send(Err(std::io::Error::other(message))).await;
+                        break;
+                    }
+                };
+
+                let future =
+                    match Python::attach(|py| event_loop.future(awaitable.bind(py).clone())) {
+                        Ok(future) => future,
+                        Err(error) => {
+                            let _ = sender
+                                .send(Err(std::io::Error::other(error.to_string())))
+                                .await;
+                            break;
+                        }
+                    };
+
+                match future.await {
+                    Ok(item) => {
+                        let bytes = Python::attach(|py| stream_item_bytes(py, item.bind(py)));
+                        match bytes {
+                            Ok(bytes) => {
+                                if sender.send(Ok(bytes)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(error) => {
+                                let _ = sender
+                                    .send(Err(std::io::Error::other(error.to_string())))
+                                    .await;
+                                break;
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        let stop =
+                            Python::attach(|py| error.is_instance_of::<PyStopAsyncIteration>(py));
+                        if !stop {
+                            let _ = sender
+                                .send(Err(std::io::Error::other(error.to_string())))
+                                .await;
+                        }
+                        break;
+                    }
+                }
+            }
+        });
+    } else {
+        let iterator = value.try_iter()?.unbind();
+        enum SyncStep {
+            Item(Py<PyAny>),
+            Stop,
+            Error(String),
+        }
+
+        tokio::task::spawn_blocking(move || loop {
+            let step = Python::attach(|py| {
+                let mut iterator = iterator.bind(py).clone();
+                match iterator.next() {
+                    None => SyncStep::Stop,
+                    Some(Ok(item)) => SyncStep::Item(item.unbind()),
+                    Some(Err(error)) => {
+                        if error.is_instance_of::<PyStopIteration>(py) {
+                            SyncStep::Stop
+                        } else {
+                            SyncStep::Error(error.to_string())
+                        }
+                    }
+                }
+            });
+
+            match step {
+                SyncStep::Stop => break,
+                SyncStep::Item(item) => {
+                    let bytes = Python::attach(|py| stream_item_bytes(py, item.bind(py)));
+                    match bytes {
+                        Ok(bytes) => {
+                            if sender.blocking_send(Ok(bytes)).is_err() {
+                                break;
+                            }
+                        }
+                        Err(error) => {
+                            let _ =
+                                sender.blocking_send(Err(std::io::Error::other(error.to_string())));
+                            break;
+                        }
+                    }
+                }
+                SyncStep::Error(message) => {
+                    let _ = sender.blocking_send(Err(std::io::Error::other(message)));
+                    break;
+                }
+            }
+        });
+    }
+
+    Ok(ChannelBody { receiver })
+}
+
 // ---------------------------------------------------------------------------
 // HTTP responses
 // ---------------------------------------------------------------------------
@@ -1148,6 +1845,7 @@ struct BuiltResponse {
     status: StatusCode,
     headers: Vec<(String, String)>,
     body: Bytes,
+    stream: Option<ChannelBody>,
     media_type: Option<Cow<'static, str>>,
 }
 
@@ -1157,6 +1855,7 @@ impl BuiltResponse {
             status,
             headers,
             body,
+            stream: None,
             media_type: Some(Cow::Borrowed("application/json")),
         }
     }
@@ -1174,6 +1873,7 @@ impl BuiltResponse {
             status,
             headers,
             body: Bytes::new(),
+            stream: None,
             media_type: None,
         }
     }
@@ -1183,17 +1883,34 @@ impl BuiltResponse {
         self
     }
 
-    fn into_hyper(self, head: bool) -> HyperResponse<Full<Bytes>> {
+    fn add_header_if_missing(&mut self, key: &str, value: &str) {
+        if !self
+            .headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case(key))
+        {
+            self.headers.push((key.to_string(), value.to_string()));
+        }
+    }
+
+    fn into_hyper(self, head: bool) -> HyperResponse<ResponseBody> {
         let status = self.status;
-        let length = self.body.len();
         let no_body = status == StatusCode::NO_CONTENT || status == StatusCode::NOT_MODIFIED;
-        let body = if head || no_body {
-            Bytes::new()
+        let full_length = if self.stream.is_none() && !no_body {
+            Some(self.body.len())
         } else {
-            self.body
+            None
+        };
+        let body = if head || no_body {
+            ResponseBody::Full(Full::new(Bytes::new()))
+        } else {
+            match self.stream {
+                Some(channel) => ResponseBody::Channel(channel),
+                None => ResponseBody::Full(Full::new(self.body)),
+            }
         };
 
-        let mut response = HyperResponse::new(Full::new(body));
+        let mut response = HyperResponse::new(body);
         *response.status_mut() = status;
         let headers = response.headers_mut();
 
@@ -1214,10 +1931,12 @@ impl BuiltResponse {
             }
         }
 
-        if !headers.contains_key(CONTENT_LENGTH) && !no_body {
-            let mut buffer = itoa::Buffer::new();
-            if let Ok(value) = HeaderValue::from_str(buffer.format(length)) {
-                headers.insert(CONTENT_LENGTH, value);
+        if let Some(length) = full_length {
+            if !headers.contains_key(CONTENT_LENGTH) {
+                let mut buffer = itoa::Buffer::new();
+                if let Ok(value) = HeaderValue::from_str(buffer.format(length)) {
+                    headers.insert(CONTENT_LENGTH, value);
+                }
             }
         }
 

@@ -33,8 +33,62 @@ DEFAULTS: dict[str, Any] = {
     "DEFAULT_CHARSET": "utf-8",
     "MAX_BODY_SIZE": 16 * 1024 * 1024,
     "ACCESS_LOG": False,
+    "ACCESS_LOG_JSON": False,
     "TITLE": "AlphaAPI",
     "VERSION": "0.1.0",
+    # Proxy / security
+    "TRUST_PROXY_HEADERS": False,
+    "TRUSTED_PROXIES": [],
+    "SECURE_PROXY_SSL_HEADER": "x-forwarded-proto",
+    "SECURE_SSL_REDIRECT": False,
+    "SECURITY_HEADERS": True,
+    "SECURE_HSTS_SECONDS": 0,
+    "SECURE_HSTS_INCLUDE_SUBDOMAINS": False,
+    "SECURE_REFERRER_POLICY": "same-origin",
+    "X_FRAME_OPTIONS": "DENY",
+    # Runtime limits
+    "REQUEST_TIMEOUT": None,
+    "MAX_CONCURRENT_REQUESTS": None,
+    "OFFLOAD_SYNC_VIEWS": False,
+    # HTTP/2 tuning
+    "HTTP2_MAX_CONCURRENT_STREAMS": None,
+    "HTTP2_INITIAL_WINDOW_SIZE": None,
+    "HTTP2_KEEP_ALIVE_INTERVAL": None,
+    "HTTP2_KEEP_ALIVE_TIMEOUT": None,
+    # Static files / templates
+    "STATIC_URL": "/static/",
+    "STATIC_ROOT": None,
+    "TEMPLATES_DIR": None,
+    "APPEND_SLASH": False,
+    # OpenAPI
+    "ENABLE_OPENAPI": False,
+    "OPENAPI_URL": "/openapi.json",
+    "DOCS_URL": "/docs",
+    "OPENAPI_TITLE": None,
+    # CORS
+    "CORS_ALLOWED_ORIGINS": [],
+    "CORS_ALLOW_ALL_ORIGINS": False,
+    "CORS_ALLOW_CREDENTIALS": False,
+    "CORS_ALLOWED_HEADERS": ["*"],
+    "CORS_ALLOWED_METHODS": ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
+    "CORS_MAX_AGE": 600,
+    # Sessions
+    "SESSION_COOKIE_NAME": "sessionid",
+    "SESSION_COOKIE_AGE": 60 * 60 * 24 * 14,
+    "SESSION_COOKIE_SECURE": False,
+    "SESSION_COOKIE_HTTPONLY": True,
+    "SESSION_COOKIE_SAMESITE": "lax",
+    "SESSION_ENGINE": "memory",
+    # CSRF
+    "CSRF_COOKIE_NAME": "csrftoken",
+    "CSRF_HEADER_NAME": "x-csrftoken",
+    "CSRF_COOKIE_SECURE": False,
+    "CSRF_COOKIE_HTTPONLY": False,
+    "CSRF_COOKIE_SAMESITE": "lax",
+    "CSRF_TRUSTED_ORIGINS": [],
+    "CSRF_EXEMPT_PATHS": [],
+    # Authentication
+    "AUTH_USER_RESOLVER": None,
 }
 
 

@@ -25,6 +25,7 @@ dependencies = []
 
 [project.optional-dependencies]
 pydantic = ["pydantic>=2"]
+templates = ["jinja2>=3"]
 dev = [
     "pytest>=8",
     "pydantic>=2",
