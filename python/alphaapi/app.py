@@ -25,7 +25,7 @@ from .http import (
     JsonResponse,
 )
 from .middleware import is_async_callable
-from .params import build_param_specs
+from .params import build_param_specs, wants_request
 from .urls import (
     ImproperlyConfigured,
     ResolvedPattern,
@@ -298,6 +298,8 @@ class Application:
                     ) from error
             return path_values, extra_values
 
+        view_wants_request = wants_request(view)
+
         def call_view(request: HttpRequest) -> Any:
             values = dict(pattern.kwargs)
             resolver_match = getattr(request, "resolver_match", None)
@@ -306,7 +308,9 @@ class Application:
             # Typed query/header/body values live outside resolver_match, which
             # is reserved for the URL-converter kwargs.
             values.update(getattr(request, "_alpha_kwargs", {}))
-            return view(request, **values)
+            if view_wants_request:
+                return view(request, **values)
+            return view(**values)
 
         has_middleware = bool(self.middleware)
         view_is_async = _is_view_async(view)

@@ -177,18 +177,55 @@ def _marker_kind(value: Any) -> str | None:
     return None
 
 
+def _signature(view: Any) -> inspect.Signature | None:
+    try:
+        return inspect.signature(view, eval_str=True)
+    except (TypeError, ValueError, NameError):
+        try:
+            return inspect.signature(view)
+        except (TypeError, ValueError):
+            return None
+
+
+def wants_request(view: Any) -> bool:
+    """Return whether ``view`` expects the request object as its first argument.
+
+    Parameters named ``request`` are always treated as the request.  For
+    backwards compatibility an unannotated first parameter (for example
+    ``lambda req: ...``) is also treated as the request, while an annotated
+    first parameter such as ``q: str`` is a typed binding.
+    """
+    signature = _signature(view)
+    if signature is None:
+        return True
+    parameters = list(signature.parameters.values())
+    if not parameters:
+        return False
+    first = parameters[0]
+    if first.kind in (
+        inspect.Parameter.VAR_POSITIONAL,
+        inspect.Parameter.VAR_KEYWORD,
+    ):
+        return False
+    if first.name in {"self", "cls"}:
+        return False
+    if first.name == "request":
+        return True
+    if first.default is not inspect.Parameter.empty:
+        return False
+    if isinstance(first.default, Param):
+        return False
+    return first.annotation is inspect.Parameter.empty
+
+
 def build_param_specs(
     view: Any,
     path_names: set[str],
 ) -> list[dict[str, Any]]:
     """Build the Rust parameter spec for the non-request parameters of ``view``."""
-    try:
-        signature = inspect.signature(view, eval_str=True)
-    except (TypeError, ValueError, NameError):
-        try:
-            signature = inspect.signature(view)
-        except (TypeError, ValueError):
-            return []
+    signature = _signature(view)
+    if signature is None:
+        return []
 
     specs: list[dict[str, Any]] = []
     for index, (name, parameter) in enumerate(signature.parameters.items()):
@@ -279,4 +316,5 @@ __all__ = [
     "Path",
     "infer_type",
     "build_param_specs",
+    "wants_request",
 ]

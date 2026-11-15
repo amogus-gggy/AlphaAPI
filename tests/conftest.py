@@ -77,3 +77,21 @@ def start_server():
     for server in servers:
         if server.thread.is_alive():
             server.stop()
+
+
+@pytest.fixture
+def settings_override():
+    """Temporarily override global settings and restore them afterwards."""
+    from alphaapi.conf import settings
+
+    original_values = dict(settings._values)
+    original_loaded = settings._loaded
+
+    def apply(**values: Any) -> None:
+        settings.configure(**values)
+
+    yield apply
+
+    settings._values.clear()
+    settings._values.update(original_values)
+    object.__setattr__(settings, "_loaded", original_loaded)
