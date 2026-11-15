@@ -172,8 +172,8 @@ async def post_detail(request, slug: str):
 ```
 
 `HttpResponse` defaults to HTML and escapes are handled explicitly with
-`html.escape`. AlphaAPI ships no template engine, so this keeps the example
-dependency-free.
+`html.escape`. This keeps the example dependency-free; optional Jinja2
+integration is covered in [Templates](../api/templates.md).
 
 ## 5. Add the JSON API views
 

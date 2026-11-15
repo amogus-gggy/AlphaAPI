@@ -11,6 +11,11 @@ It deliberately ships **no ORM** and no database layer. Bring your own data
 access (SQLAlchemy, asyncpg, raw SQL, an HTTP client, ...). There is also **no
 FastAPI compatibility layer**: the public API is its own.
 
+Built-in features include typed request binding, streaming and file responses,
+multipart uploads, security headers, CORS, CSRF, sessions, authentication
+resolvers, request IDs, Prometheus metrics, OpenAPI generation, static files,
+optional Jinja2 templates, a real-server test client, and CLI inspection tools.
+
 > Status: early preview. The public API is intentionally small and may evolve.
 
 ## Install (from source)
@@ -187,7 +192,8 @@ settings.configure(
 )
 ```
 
-Default settings:
+Default settings (see the [settings reference](docs/api/settings.md) for the
+full list):
 
 | Setting           | Default        |
 | ----------------- | -------------- |
@@ -200,6 +206,12 @@ Default settings:
 | `DEFAULT_CHARSET` | `"utf-8"`      |
 | `MAX_BODY_SIZE`   | `16 MiB`       |
 | `ACCESS_LOG`      | `False`        |
+| `ACCESS_LOG_JSON` | `False`        |
+| `SECURITY_HEADERS` | `True`        |
+| `STATIC_URL`      | `"/static/"`   |
+| `STATIC_ROOT`     | `None`         |
+| `TEMPLATES_DIR`   | `None`         |
+| `ENABLE_OPENAPI`  | `False`        |
 | `TITLE`           | `"AlphaAPI"`   |
 | `VERSION`         | `"0.1.0"`      |
 
@@ -248,6 +260,28 @@ async def item(request, item_id: int):
 Both `async def` and plain `def` views are supported. New code should prefer
 `async def`; AlphaAPI executes async views on a dedicated Python event loop.
 
+### Typed parameters
+
+Declare query, header, path, and body values in the signature and AlphaAPI
+validates and coerces them before the view runs:
+
+```python
+from alphaapi import Body, Header, JsonResponse, Query
+
+async def search(
+    request,
+    q: str,
+    limit: int = 10,
+    tags: list[str] = Query(default=[]),
+    x_api_key: str = Header(...),
+):
+    return JsonResponse({"q": q, "limit": limit, "tags": tags})
+```
+
+Invalid or missing values return `422` with structured details. Pydantic models
+work as body annotations. Views that do not need the request can omit it. See
+[binding parameters](docs/api/binding.md).
+
 ### Class-based views
 
 ```python
@@ -277,13 +311,16 @@ works and calls `as_view()` for you.
 | `request.method` | HTTP method |
 | `request.path`, `request.path_info` | Request path |
 | `request.GET` | Query parameters (`QueryDict`, `.getlist()` for repeats) |
-| `request.POST` | URL-encoded form fields (`QueryDict`) |
+| `request.POST` | URL-encoded or multipart text fields (`QueryDict`) |
+| `request.FILES` | Uploaded files (`UploadedFile`) |
 | `request.COOKIES` | Parsed cookies |
 | `request.headers` | Lowercase header mapping |
 | `request.body` | Raw body bytes |
 | `request.json()` | Parse JSON body |
 | `request.text()` | Body as text |
-| `request.client` | Client IP address |
+| `request.client` | Client IP (proxy-aware when enabled) |
+| `request.scheme`, `request.is_secure()` | Scheme, including trusted proxy headers |
+| `request.build_absolute_uri()` | Absolute URL helper |
 | `request.META` | CGI-style metadata mapping |
 
 ### Responses
@@ -304,6 +341,19 @@ JsonResponse({"ok": True}, status=201)
 
 Returning a `dict`, `list`, `str`, or `bytes` is also accepted and normalized
 automatically.
+
+Streaming, server-sent events, and files have dedicated responses:
+
+```python
+from alphaapi import FileResponse, SseResponse, StreamingHttpResponse
+
+return StreamingHttpResponse(chunks(), content_type="text/plain")
+return SseResponse(event_stream())
+return FileResponse("report.pdf", request=request)
+```
+
+Passing `request=` to `FileResponse` enables `ETag`, `Last-Modified`, and range
+requests. See [streaming and files](docs/api/streaming.md).
 
 ### Exceptions
 
@@ -341,6 +391,76 @@ class TimingMiddleware:
 
 List it in `MIDDLEWARE`. Async middleware is recommended; middleware runs inside
 the async pipeline whenever it is configured.
+
+## Security and sessions
+
+`ALLOWED_HOSTS`, security headers, and HSTS are enforced by the core. Optional
+middleware adds HTTPS redirects, CORS, CSRF, sessions, and authentication:
+
+```python
+MIDDLEWARE = [
+    "alphaapi.SecurityMiddleware",
+    "alphaapi.CorsMiddleware",
+    "alphaapi.CsrfMiddleware",
+    "alphaapi.SessionMiddleware",
+    "alphaapi.AuthenticationMiddleware",
+]
+```
+
+```python
+ALLOWED_HOSTS = ["example.com"]
+SECURE_SSL_REDIRECT = True
+CSRF_EXEMPT_PATHS = ["/api/webhooks/"]
+AUTH_USER_RESOLVER = "project.auth.get_user"
+```
+
+`request.session` is a mutable mapping. `login()` / `logout()` store the user id
+in the session, and `request.user` is populated by your resolver. Signed-cookie
+helpers (`dumps_signed` / `loads_signed`) use `SECRET_KEY`. See
+[security](docs/api/security.md) and [sessions](docs/api/sessions.md).
+
+## Observability
+
+```python
+from alphaapi import (
+    MetricsMiddleware,
+    RequestIdMiddleware,
+    health_response,
+    metrics_response,
+    path,
+)
+
+app = Application(
+    urlpatterns=[
+        path("health/", health_response, name="health"),
+        path("metrics/", metrics_response, name="metrics"),
+    ],
+    middleware=[RequestIdMiddleware, MetricsMiddleware],
+)
+```
+
+`X-Request-ID` is propagated or generated, metrics are exposed in Prometheus
+text format, and access logs can be plain text or JSON (`ACCESS_LOG_JSON`). See
+[observability](docs/api/observability.md).
+
+## OpenAPI, static files, and templates
+
+```python
+ENABLE_OPENAPI = True
+OPENAPI_URL = "/openapi.json"
+DOCS_URL = "/docs"
+
+STATIC_ROOT = "/srv/myapp/static"
+STATIC_URL = "/static/"
+
+TEMPLATES_DIR = "/srv/myapp/templates"
+```
+
+`app.openapi()` works without the built-in routes. Static files are streamed
+with range support, and Jinja2 integration is available with
+`pip install "alphaapi[templates]"`. See [OpenAPI](docs/api/openapi.md),
+[static files](docs/api/static-files.md), and
+[templates](docs/api/templates.md).
 
 ## Apps
 
@@ -387,11 +507,16 @@ alphaapi startapp blog
 
 alphaapi runserver project.app:app --host 127.0.0.1 --port 8000
 alphaapi runserver project.app:app --reload
+alphaapi runserver project.app:app --workers 4 --access-log
 alphaapi runserver project.app:app --settings project.settings
+
+alphaapi routes project.app:app
+alphaapi check project.app:app
 ```
 
-`manage.py` style entry points are just thin wrappers around `alphaapi.cli`.
-Generated projects include a working `manage.py`.
+`routes` lists every resolved path and name. `check` validates configuration
+(such as an empty `ALLOWED_HOSTS`) and exits non-zero on errors. `manage.py`
+style entry points are just thin wrappers around `alphaapi.cli`.
 
 ## Benchmarks
 
@@ -439,6 +564,23 @@ runs the `docs` GitHub Actions workflow and deploys the site to GitHub Pages.
 pytest -q
 ```
 
+The bundled `Client` starts the real server on an ephemeral loopback port:
+
+```python
+from alphaapi import Client
+
+with Client(app) as client:
+    response = client.get("/items/?limit=5")
+    assert response.status_code == 200
+    assert response.json()["items"] == []
+
+    client.post("/login/", data={"username": "sam"})
+    client.post("/items/", json={"name": "pen"})
+```
+
+It keeps cookies across requests and supports JSON, form, raw-body, header, and
+streaming responses. See [testing](docs/api/testing.md).
+
 ## How it works
 
 The Python layer resolves URLconfs at startup and hands a compact route
@@ -468,17 +610,16 @@ Rust.
 ## Limits
 
 - No ORM, database layer, migrations, or admin.
-- No template engine or static-file serving built in.
 - No regular-expression URL routes; use path converters.
 - No WebSocket support.
-- One body representation per view (access it through the request).
+- Sessions default to a process-local memory store; provide a shared
+  `SessionStore` for multi-worker deployments.
 - HTTP/2 is supported over cleartext connections (h2c, prior knowledge) and is
   auto-detected alongside HTTP/1.1. TLS is not built in; place the server behind
   a reverse proxy if you need HTTPS.
 - Sync views should stay short. Long CPU-bound work should move to async code or
   another process.
-- Async exception handlers are not driven automatically; exception handlers run
-  synchronously.
+- Jinja2 template support is optional (`pip install "alphaapi[templates]"`).
 
 ## License
 

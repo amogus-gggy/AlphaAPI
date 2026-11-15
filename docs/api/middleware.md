@@ -23,6 +23,23 @@ MIDDLEWARE = ["project.middleware.TimingMiddleware"]
 Middleware may be sync or async. When middleware is configured, routes run on
 AlphaAPI's async event loop so both styles compose.
 
+## Built-in middleware
+
+| Middleware | Purpose |
+| --- | --- |
+| `SecurityMiddleware` | HTTPS redirects and security headers |
+| `CorsMiddleware` | CORS headers and preflight responses |
+| `CsrfMiddleware` | CSRF token verification |
+| `SessionMiddleware` | Cookie-backed sessions |
+| `AuthenticationMiddleware` | Resolve `request.user` |
+| `RequestIdMiddleware` | Propagate or generate `X-Request-ID` |
+| `MetricsMiddleware` | Record request counts and durations |
+
+Order matters: place session middleware before authentication, and security /
+CORS middleware early so their headers apply to all responses. See
+[Security](security.md), [Sessions and auth](sessions.md), and
+[Observability](observability.md).
+
 ## Reference
 
 ::: alphaapi.middleware.MiddlewareMixin

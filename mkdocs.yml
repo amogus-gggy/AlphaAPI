@@ -98,10 +98,20 @@ nav:
       - Application: api/application.md
       - Requests: api/requests.md
       - Responses: api/responses.md
+      - Binding parameters: api/binding.md
+      - Streaming & files: api/streaming.md
       - Views: api/views.md
       - Routing: api/routing.md
       - Settings: api/settings.md
       - Exceptions: api/exceptions.md
       - Middleware: api/middleware.md
+      - Security: api/security.md
+      - Sessions & auth: api/sessions.md
+      - Observability: api/observability.md
+      - OpenAPI: api/openapi.md
+      - Static files: api/static-files.md
+      - Templates: api/templates.md
+      - Testing: api/testing.md
+      - CLI: api/cli.md
       - Apps: api/apps.md
       - Low-level core: api/core.md

@@ -26,7 +26,8 @@ def handle_missing(request, exception):
 ```
 
 Exception handlers receive the `HttpRequest` and the exception instance.
-Handlers are matched in registration order against the exception type.
+Handlers are matched in registration order against the exception type. Handlers
+may be sync or async.
 
 ## Reference
 

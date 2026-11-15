@@ -102,18 +102,27 @@ curl http://127.0.0.1:8000/items/42/?q=hello
 
 | Feature | AlphaAPI |
 | --- | --- |
-| HTTP server | Rust + hyper |
+| HTTP server | Rust + hyper, HTTP/1.1 and cleartext HTTP/2 |
 | Routing | Rust `matchit` router with Django path converters |
 | Views | Sync and async functions and classes |
+| Typed binding | Query, header, path, and JSON body parameters with validation |
 | JSON | Rust serializer for dicts, lists, and built-in types |
-| Settings | Django-style settings module |
-| Middleware | Django-style async middleware |
-| CLI | `startproject`, `startapp`, `runserver` |
+| Streaming | Incremental responses, SSE, and ranged file responses |
+| Uploads | Multipart forms and `UploadedFile` |
+| Security | Allowed hosts, security headers, CORS, CSRF, signed cookies |
+| Sessions | Cookie sessions and pluggable authentication resolvers |
+| Observability | Request IDs, Prometheus metrics, health checks, access logs |
+| Extras | OpenAPI/Swagger, static files, Jinja2 templates, test client |
+| CLI | `startproject`, `startapp`, `runserver`, `routes`, `check` |
 | Database / ORM | Bring your own |
 
 ## Explore the docs
 
 - **[Getting started](getting-started.md)** — install, scaffold, and run.
 - **[Tutorials](tutorials/index.md)** — build a task API, a blog, and deploy.
+- **[Binding parameters](api/binding.md)** — validate query, header, path, and
+  body values from view signatures.
+- **[Security](api/security.md)** and **[sessions](api/sessions.md)** — add
+  production safeguards and authentication.
 - **[API reference](api/index.md)** — auto-generated from the source and
   docstrings.

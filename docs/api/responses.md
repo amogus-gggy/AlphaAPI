@@ -14,6 +14,15 @@ async def created(request):
     return response
 ```
 
+Plain return values are normalized too:
+
+```python
+return {"ok": True}    # JSON
+return "hello"         # text/plain
+return b"raw bytes"    # application/octet-stream
+return None            # 204 No Content
+```
+
 ## Header behaviour
 
 `response.headers` is a mutable, multi-value mapping:
@@ -25,6 +34,24 @@ async def created(request):
 
 `set_cookie()` and `delete_cookie()` append rather than replace, so multiple
 cookies work correctly.
+
+The default content type is available as `response.media_type`. The Rust core
+adds it to the wire response when the body is sent.
+
+## Streaming, SSE, and files
+
+Use dedicated response classes for incremental bodies:
+
+```python
+from alphaapi import FileResponse, SseResponse, StreamingHttpResponse
+
+return StreamingHttpResponse(chunks(), content_type="text/plain")
+return SseResponse(event_stream())
+return FileResponse("report.pdf", request=request)
+```
+
+See [Streaming and files](streaming.md) for ranges, conditional requests, and
+event formatting.
 
 ## Reference
 
@@ -65,3 +92,13 @@ cookies work correctly.
 ::: alphaapi.http.response.HttpResponseNotAllowed
 
 ::: alphaapi.http.response.HttpResponseServerError
+
+::: alphaapi.http.response.HttpResponseConflict
+
+::: alphaapi.http.response.HttpResponseGone
+
+::: alphaapi.http.response.HttpResponseTooManyRequests
+
+::: alphaapi.http.response.HttpResponseServiceUnavailable
+
+::: alphaapi.http.response.HttpResponseGatewayTimeout

@@ -20,6 +20,15 @@ if __name__ == "__main__":
     app.run(port=8000)
 ```
 
+## Schema and test client
+
+`app.openapi()` returns an OpenAPI 3.1 document built from your routes and typed
+view parameters. Set `ENABLE_OPENAPI = True` to mount the JSON schema and
+Swagger UI routes automatically. See [OpenAPI](openapi.md).
+
+`app.test_client()` returns a [Client](testing.md) that runs the real server on
+an ephemeral loopback port.
+
 ## Reference
 
 ::: alphaapi.app.Application
@@ -27,6 +36,8 @@ if __name__ == "__main__":
       members:
         - add_url_patterns
         - reverse
+        - openapi
+        - test_client
         - on_startup
         - on_shutdown
         - exception_handler

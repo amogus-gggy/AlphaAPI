@@ -39,14 +39,30 @@ configured directly for scripts.
 DEBUG = False
 SECRET_KEY = "load-this-from-the-environment"
 ROOT_URLCONF = "blogsite.urls"
+ALLOWED_HOSTS = ["example.com"]
 
 INSTALLED_APPS = ["blog.apps.BlogConfig"]
-MIDDLEWARE = ["blogsite.middleware.RequestContextMiddleware"]
+MIDDLEWARE = [
+    "blogsite.middleware.RequestContextMiddleware",
+    "alphaapi.SecurityMiddleware",
+    "alphaapi.SessionMiddleware",
+]
 
 MAX_BODY_SIZE = 2 * 1024 * 1024
 ACCESS_LOG = True
+ACCESS_LOG_JSON = True
 TITLE = "My Blog"
 VERSION = "1.0.0"
+
+SECURITY_HEADERS = True
+SECURE_HSTS_SECONDS = 31536000
+SECURE_HSTS_INCLUDE_SUBDOMAINS = True
+SECURE_SSL_REDIRECT = True
+TRUST_PROXY_HEADERS = True
+TRUSTED_PROXIES = ["127.0.0.1"]
+
+SESSION_COOKIE_SECURE = True
+CSRF_COOKIE_SECURE = True
 ```
 
 `ALPHAAPI_SETTINGS_MODULE` selects a settings module when the application is
@@ -93,21 +109,50 @@ connections and after it stops.
 
 ## Health check
 
-Add a lightweight endpoint that does not touch expensive dependencies:
+Use the ready-made health helpers, or write your own readiness probe:
 
 ```python
-async def health(request):
-    return JsonResponse({"status": "ok"})
-```
+from alphaapi import health_response, path, readiness_response
 
-```python
 urlpatterns = [
-    path("health/", health, name="health"),
+    path("health/", health_response, name="health"),
+    path("ready/", readiness_response, name="ready"),
     # ...
 ]
 ```
 
-Point your load balancer or container orchestrator at `/health/`.
+Point your load balancer or container orchestrator at `/health/`. Replace
+`readiness_response` with a custom view if readiness should probe the database
+or cache.
+
+## Security
+
+`ALLOWED_HOSTS` is enforced by the Rust core. Set it to your real hostnames:
+
+```python
+ALLOWED_HOSTS = ["example.com", ".example.com"]
+```
+
+Security headers are enabled by default. Enable HSTS only after HTTPS works end
+to end, and add `SecurityMiddleware` if you want automatic HTTPS redirects:
+
+```python
+SECURITY_HEADERS = True
+SECURE_HSTS_SECONDS = 31536000
+SECURE_SSL_REDIRECT = True
+```
+
+Behind a proxy, enable forwarded headers and list only proxies you control:
+
+```python
+TRUST_PROXY_HEADERS = True
+TRUSTED_PROXIES = ["127.0.0.1"]
+```
+
+Then `request.client` uses the forwarded client address when the peer is a
+trusted proxy, and `request.scheme` / `request.build_absolute_uri()` reflect the
+forwarded HTTPS scheme. Set `SESSION_COOKIE_SECURE` and `CSRF_COOKIE_SECURE`
+too. See [Security](../api/security.md) for CORS, CSRF, and signed cookies.
 
 ## Run in development
 
@@ -198,9 +243,10 @@ sudo systemctl reload nginx
 
 Use a TLS certificate from Let's Encrypt or your cloud provider at the proxy.
 
-`request.client` contains the peer address of the connection. When running
-behind a proxy that is not on the same host, read `x-forwarded-for` from
-`request.headers` if you need the original client address.
+`request.client` contains the peer address of the connection by default. With
+`TRUST_PROXY_HEADERS = True` and the proxy listed in `TRUSTED_PROXIES`, it uses
+`X-Forwarded-For` and `X-Forwarded-Proto` instead, so client IPs, HTTPS
+detection, and absolute URLs stay correct.
 
 ## Body size limits
 
@@ -223,15 +269,41 @@ or:
 
 ```python
 ACCESS_LOG = True
+ACCESS_LOG_JSON = True
 ```
 
 Each request emits a line containing the method, path, status, and duration.
+JSON logs are one object per line and are easier to ship to an aggregator.
+
+## Metrics
+
+Add the metrics middleware and expose the Prometheus endpoint:
+
+```python
+from alphaapi import Application, MetricsMiddleware, metrics_response, path
+
+app = Application(
+    urlpatterns=[path("metrics/", metrics_response, name="metrics")],
+    middleware=[MetricsMiddleware],
+)
+```
+
+Metrics are process-local; scrape every worker or aggregate externally. See
+[Observability](../api/observability.md).
 
 ## Static files
 
-AlphaAPI does not serve static files. Use the reverse proxy, a CDN, or object
-storage for CSS, JavaScript, images, and downloads. Keep application routes
-under a separate prefix such as `/api/` or let the proxy prefer static paths.
+For simple deployments, set `STATIC_ROOT` and `STATIC_URL` and AlphaAPI will
+serve files with range and conditional-request support:
+
+```python
+STATIC_ROOT = "/srv/alphaapi/blogsite/static"
+STATIC_URL = "/static/"
+```
+
+In production, prefer the reverse proxy, a CDN, or object storage for CSS,
+JavaScript, images, and downloads. Keep application routes under a separate
+prefix such as `/api/`. See [Static files](../api/static-files.md).
 
 ## Graceful shutdown
 
@@ -243,14 +315,19 @@ run during the shutdown path.
 ## Checklist
 
 - [ ] `DEBUG = False` and secrets loaded from the environment.
+- [ ] `ALLOWED_HOSTS` set to real hostnames.
 - [ ] AlphaAPI bound to `127.0.0.1` behind a TLS-terminating proxy.
+- [ ] `TRUST_PROXY_HEADERS` enabled with a trusted proxy list.
+- [ ] Secure cookies, CSRF, and HSTS configured.
 - [ ] `MAX_BODY_SIZE` set appropriately.
-- [ ] Access logging enabled.
-- [ ] Health endpoint configured.
+- [ ] Access logging enabled (JSON if you ship logs).
+- [ ] Health and readiness endpoints configured.
+- [ ] Metrics endpoint scraped if you use `MetricsMiddleware`.
 - [ ] Startup/shutdown hooks tested.
 - [ ] Static assets served by the proxy or a CDN.
 - [ ] Auto-reload disabled.
 - [ ] A process manager restarts the service after failures.
+- [ ] `alphaapi check` runs clean in deployment.
 
 ## Next steps
 

@@ -119,12 +119,82 @@ Common request attributes:
 | `request.method` | HTTP method |
 | `request.path` | Request path |
 | `request.GET` | Query parameters (`QueryDict`) |
-| `request.POST` | URL-encoded form fields |
+| `request.POST` | URL-encoded form fields and multipart text fields |
+| `request.FILES` | Uploaded files (`UploadedFile`) |
 | `request.COOKIES` | Parsed cookies |
 | `request.headers` | Lowercase header mapping |
 | `request.body` | Raw body bytes |
 | `request.json()` | Parse the body as JSON |
 | `request.text()` | Decode the body as text |
+| `request.client` | Client IP address |
+
+## Bind typed parameters
+
+Instead of reading query parameters by hand, declare them in the view
+signature. AlphaAPI validates and coerces them before calling the view:
+
+```python title="mysite/views.py"
+from alphaapi import Header, JsonResponse, Query
+
+async def search(
+    request,
+    q: str,
+    limit: int = 10,
+    tags: list[str] = Query(default=[]),
+    x_api_key: str = Header(...),
+):
+    return JsonResponse({"q": q, "limit": limit, "tags": tags})
+```
+
+`/search/?q=pen&limit=5&tags=ink&tags=paper` calls the view with `q="pen"`,
+`limit=5`, and `tags=["ink", "paper"]`. Missing required values or bad types
+return `422` with a JSON error. See
+[Binding parameters](api/binding.md) for headers, bodies, Pydantic models, and
+views that omit the request argument.
+
+## Multipart uploads
+
+`request.POST` and `request.FILES` handle `multipart/form-data` automatically:
+
+```python
+async def upload(request):
+    upload = request.FILES["document"]
+    return JsonResponse({
+        "name": upload.filename,
+        "size": upload.size,
+        "content_type": upload.content_type,
+    })
+```
+
+## Stream responses and files
+
+Use `StreamingHttpResponse`, `SseResponse`, and `FileResponse` for bodies that
+should not be built in memory:
+
+```python
+from alphaapi import FileResponse, SseResponse, StreamingHttpResponse
+
+async def numbers(request):
+    async def chunks():
+        for number in range(5):
+            yield {"number": number}
+            yield "\n"
+
+    return StreamingHttpResponse(chunks(), content_type="application/json")
+
+async def events(request):
+    async def stream():
+        yield {"event": "tick", "data": {"value": 42}}
+
+    return SseResponse(stream())
+
+async def report(request):
+    return FileResponse("reports/latest.pdf", request=request)
+```
+
+Passing `request=` to `FileResponse` enables `ETag`, `Last-Modified`, and range
+requests. See [Streaming and files](api/streaming.md).
+
 
 ## Return a response
 
@@ -155,6 +225,38 @@ alphaapi runserver mysite.app:app --reload
 
 The reloader watches Python and TOML files and restarts the server when they
 change. It is intended for development only.
+
+## Test your app
+
+`Client` starts the real server on an ephemeral loopback port, so tests exercise
+routing, middleware, cookies, and streaming end to end:
+
+```python title="tests/test_app.py"
+from alphaapi import Client
+
+from mysite.app import app
+
+
+def test_index():
+    with Client(app) as client:
+        response = client.get("/")
+        assert response.status_code == 200
+        assert response.json() == {"message": "Hello, AlphaAPI!"}
+```
+
+You can also use `app.test_client()`. See [Testing](api/testing.md) for JSON,
+form, cookie, and raw-body helpers.
+
+## Inspect and validate
+
+```bash
+alphaapi routes mysite.app:app
+alphaapi check mysite.app:app
+```
+
+`routes` prints every resolved route; `check` validates the application
+configuration (for example, an empty `ALLOWED_HOSTS`) and exits non-zero on
+errors. See [CLI](api/cli.md).
 
 ## How it works
 

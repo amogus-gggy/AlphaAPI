@@ -1,7 +1,8 @@
 # Views
 
 Views are callables that accept an `HttpRequest` and return a response (or a
-value AlphaAPI can turn into one).
+value AlphaAPI can turn into one). Query, header, path, and body values can be
+declared directly in the signature; see [Binding parameters](binding.md).
 
 ## Function views
 
