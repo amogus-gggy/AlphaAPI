@@ -1,0 +1,77 @@
+Code Review — AlphaAPI
+What it is: a Django-shaped async Python web framework with a Rust/hyper HTTP core, ~4.4k lines Python + ~2.7k lines Rust, 109 passing integration tests. Overall quality is genuinely strong: clean separation (Python routing/views, Rust server/hot path), well-written comments, consistent Django-like API, format/clippy clean, and a coherent docs site. Below are the issues worth acting on.
+Critical / High
+1. Python 3.9 is advertised but broken
+pyproject.toml says requires-python = ">=3.9", yet python/alphaapi/params.py:115:
+if origin in (typing.Union, types.UnionType):
+types.UnionType only exists on Python 3.10+. Because this line is evaluated on every call to _unwrap_annotation, route registration with any typed parameter raises AttributeError on 3.9. The binary is abi3-py39, so wheels will install on 3.9 and then fail at startup.
+Fix: getattr(types, "UnionType", typing.Union) (or use {typing.Union} plus a guarded check), and add a 3.9 job to CI.
+2. needs_request is always true — the lazy-request hot path is defeated
+In python/alphaapi/app.py:393-404, _build_spec() unconditionally prepends a request parameter, so spec.needs_request in Rust is always true even for async def health(): .... Consequences:
+- full_request = spec.needs_request || has_handlers is always true (src/app.rs:750).
+- Every request materializes headers, query map, client IP, and reads the entire body (needs_body is true) — contradicting README claims like “Lazy request materialization” and “Views that do not need the request can omit it.”
+- HttpRequest.__init__ then eagerly builds META, re-parses GET, cookies, and forms for every request (http/request.py:84-108).
+The routing handler signature is hard-wired to receive raw_request, so this needs a small refactor (e.g. inspect wants_request and only add the request param / body flags when actually needed, or make the Python wrapper tolerate a missing raw request).
+3. Settings/URL registry is process-global and leaks across apps
+- _NAMED_PATTERNS (urls.py:287) is global and register_patterns() only ever adds. Two Application instances in one process pollute each other’s reverse(). I confirmed:
+a.reverse("a") -> "/"
+b._ensure_resolved(); b.reverse("b") -> "/"   # but "a" is still registered globally
+- AppRegistry.populate() permanently sets _populated = True (apps.py:52-59), so a second app with different INSTALLED_APPS silently gets the first app’s registry. Confirmed:
+r.populate(["json"])   -> ['json']
+r.populate(["math"])   -> ['json']
+- Application(settings_config=...) mutates the global settings singleton, so apps cannot coexist with different settings.
+This matters for test suites and for embedding/multiple apps in one process. Consider per-application resolvers/registries (or at least reset in Application.__init__), and make populate() idempotent-but-reconfigurable.
+4. Middleware is instantiated once per route, not once per application
+_make_handler() calls self._build_async_chain(...) for each route (app.py:318-319), which runs entry(handler) per pattern (app.py:381-384). I confirmed 3 routes with one middleware class → 3 instances.
+Django semantics (and most middleware assumptions) are one instance per app. Stateful middleware — rate limiters, caches, metric objects, connection pools — will be silently duplicated. Build the chain once around a dispatcher, or cache middleware instances per app.
+5. Security headers are missing from early-return responses
+apply_security_headers() runs only after dispatch() (src/app.rs:838-840). Early returns bypass it: host rejection (400), router 404, 405, automatic OPTIONS, 503/504. Confirmed:
+GET /ok/       -> x-content-type-options, x-frame-options, referrer-policy
+GET /missing/  -> only server: alphaapi
+404s are exactly where clickjacking/MIME-sniffing protections matter. Apply headers centrally in the response construction path (or wrap every return in a helper).
+6. Docs CI cannot build the documented site
+.github/workflows/docs.yml installs only mkdocs-material, mkdocstrings, ruff; it never installs/builds the package or the Rust extension. docs/api/*.md uses ::: alphaapi... and mkdocs.yml points mkdocstrings at python/, but alphaapi/__init__.py imports ._core, which is gitignored and not present on the runner. mkdocs build --strict should fail on import. Add pip install -e . (with a Rust toolchain) or a maturin build step. Also: there is no test/CI workflow at all for Python or Rust.
+Medium
+7. Mutable defaults are shared across requests
+Query(default=[]) (used in the README example) is cloned by reference in Rust (default.clone_ref(py)), so all requests share one list. Confirmed:
+GET /t/ -> {"tags": ["x"]}
+GET /t/ -> {"tags": ["x", "x"]}   # same list object
+Document default=None as the safe pattern, or copy container defaults per request in Rust (call_handler/missing_value).
+8. TRUST_PROXY_HEADERS does not gate request.client
+Rust effective_client() (src/app.rs:888-906) trusts X-Forwarded-For whenever the peer is in TRUSTED_PROXIES; it never sees TRUST_PROXY_HEADERS. Only HttpRequest.is_secure() (request.py:159-166) checks that flag. Docs (docs/api/security.md:69-75) say request.client uses XFF only “With TRUST_PROXY_HEADERS enabled”, and warn to disable it against direct clients. Either pass the flag into the core or update docs/validation. Additionally, taking the leftmost XFF value is spoofable when any upstream appends rather than overwrites; prefer the rightmost untrusted hop.
+9. Session fixation on login
+auth.login() (auth.py:72-78) writes the user ID into the existing session without calling session.cycle_key(). Provide key rotation on privilege change (ideally inside login()), and consider warning when SECRET_KEY is empty while SessionMiddleware is enabled.
+10. IPv6 Host headers fail ALLOWED_HOSTS matching
+app.rs:872-877 (and security.py:15) use rsplit_once(':'); for Host: [::1] (no port) this slices inside the address, producing "["/":" and rejecting a valid host. Parse [addr] explicitly before stripping the port. Also consider trimming a trailing dot (example.com.).
+11. OpenAPI document is invalid for multi-method paths
+openapi.py:99-116 gives every method the same operationId and emits the same operation for GET/POST/PUT/… regardless of the view. Duplicate operationIds violate the spec (validators/UIs complain), and the method list is misleading. Confirmed a single named route produced ['b', 'b', 'b', ...]. Use f"{name}_{method}" and only advertise methods the view supports.
+12. APPEND_SLASH is dead configuration
+Present in conf.py:62 but referenced nowhere. Either implement redirects (common Django expectation) or remove it so users aren’t misled.
+13. Request-body draining is unbounded for non-body routes
+app.rs:793-805 spawns a background drain that reads the entire body with no max_body_size enforcement when needs_body is false. Once issue #2 is fixed (so this path becomes reachable), a large body tied to a cheap route becomes a bandwidth/CPU DoS vector. Apply the same limit while discarding.
+Low / polish
+- _ensure_registered / _ensure_exception_handlers set their guard flag before doing the work (app.py:429-438, 440-445). If registration raises, subsequent run() calls silently skip it and start with partial routes.
+- resolve() mutates pattern kwargs (urls.py:366-372), so calling it repeatedly accumulates/overwrites state on the pattern object.
+- OpenAPI view rebuilds the whole schema per request (openapi.py:134-138) — cache it after first build.
+- Prometheus metric labels are not escaped (observability.py:62-80); route falls back to the raw request path, so a path containing " or a newline can corrupt the exposition format.
+- Content-Disposition uses shlex.quote (response.py:341-344), producing shell-style filename='my file.txt' rather than a valid quoted HTTP parameter (or RFC 5987 filename*).
+- Async auth resolver isn’t awaited (auth.py:64-69); an async def resolver becomes request.user as a coroutine object.
+- Client._free_port() has a TOCTOU race between releasing the port and the server binding; parallel test clients can occasionally collide. Retry on bind failure would make the test client deterministic.
+- Client joins duplicate response headers with ", " (testing.py:151-157), which is wrong for Set-Cookie (they handle cookies separately, but response.headers["set-cookie"] is misleading).
+- View positional-only typed params are always passed as keywords (params.py:305); a def view(request, q: str, /) would fail at runtime.
+- File uploads are fully buffered in memory (multipart.py), and the email parser is used on untrusted input. MAX_BODY_SIZE bounds this, but a per-file limit / spool option would be safer.
+- No LICENSE file despite MIT metadata and README.
+- Version is duplicated in pyproject.toml, Cargo.toml, conf.py (VERSION), and __init__.py; they will drift. Derive at least Python __version__ from package metadata.
+- README benchmark claim (“12–22x”) compares a multi-threaded Rust server against a single-process uvicorn with synchronous FastAPI handlers. The methodology is documented, but the headline number is easy to misread; consider noting worker configuration explicitly.
+- MAX_CONCURRENT_REQUESTS rejects with 503 immediately (app.rs:560-575) rather than queueing. This may surprise users; it is worth documenting as “admission control” behavior.
+- app.rs is ~1,950 lines in one module with no Rust unit tests. The integration tests are good, but splitting dispatch/body/response/streaming and adding unit tests for read_body, range parsing, host matching, and JSON escaping would reduce regression risk.
+- No ruff/mypy configuration; a project-local [tool.ruff] (and CI lint job) would prevent the 58 diagnostics currently reported under a stricter global Ruff config.
+Suggested priority order
+1. Fix Python 3.9 (types.UnionType) — released package is broken on a supported version.
+2. Fix/refactor needs_request + security headers on early returns — correctness + hot-path promise.
+3. Make URL/app registries scoped per application or explicitly reset.
+4. Build middleware once per app.
+5. Add a real CI workflow: cargo fmt --check, clippy, pytest (3.9–3.13), ruff, and docs build with the extension compiled.
+6. Address session fixation, proxy-header gating, OpenAPI operationIds, mutable defaults.
+7. Clean up dead settings, docs/benchmark wording, and packaging polish.
+Strengths to preserve: the Django-shaped API is coherent and well documented; the Rust/Python boundary is thoughtfully designed (zero-copy bodies, direct JSON encoding, GIL-aware worker count); error handling and exception-handler layering are solid; and the integration test suite covers the hard paths well (streaming, ranges, multipart, sessions, security). Most of the issues above are scoping/consistency bugs rather than architectural flaws.
