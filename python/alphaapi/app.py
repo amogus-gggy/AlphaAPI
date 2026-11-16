@@ -14,7 +14,7 @@ from types import SimpleNamespace
 from typing import Any, Callable, Iterable
 
 from . import _core
-from .apps import AppRegistry, apps as default_apps
+from .apps import AppRegistry
 from .conf import Settings, settings
 from .exceptions import HTTPException, Http404, PermissionDenied
 from .http import (
@@ -26,12 +26,7 @@ from .http import (
 )
 from .middleware import is_async_callable
 from .params import build_param_specs, wants_request
-from .urls import (
-    ImproperlyConfigured,
-    ResolvedPattern,
-    register_patterns,
-    reverse as reverse_url,
-)
+from .urls import ImproperlyConfigured, ResolvedPattern, flatten, reverse as reverse_url
 from .views import View
 
 HTTP_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD", "TRACE")
@@ -109,7 +104,7 @@ class Application:
         self.version = self.settings.VERSION
         self.debug = bool(self.settings.DEBUG)
 
-        self.apps: AppRegistry = default_apps
+        self.apps: AppRegistry = AppRegistry()
         self.apps.populate(self.settings.INSTALLED_APPS)
 
         supplied_urls = urlpatterns if urlpatterns is not None else urls
@@ -129,7 +124,11 @@ class Application:
         self._exception_handlers: dict[type[BaseException], Callable[..., Any]] = {}
         self._startup: list[Callable[..., Any]] = []
         self._shutdown: list[Callable[..., Any]] = []
+        # Named-route registry scoped to this application, so two Application
+        # instances in one process cannot pollute each other's reverse().
+        self._named_patterns: dict[str, Any] = {}
         self._resolved: list[ResolvedPattern] = []
+        self._chains: dict[int, tuple[Any, Any]] = {}
         self._registered = False
         self._handlers_registered = False
 
@@ -213,13 +212,24 @@ class Application:
         args: Iterable[Any] | None = None,
         kwargs: dict[str, Any] | None = None,
     ) -> str:
+        """Build a URL for a named route of *this application only*.
+
+        The registry is per-application (not process-global), so multiple
+        ``Application`` instances can coexist without leaking names into each
+        other's ``reverse()``.
+        """
         self._ensure_resolved()
-        return reverse_url(viewname, args=args, kwargs=kwargs)
+        return reverse_url(viewname, args=args, kwargs=kwargs, registry=self._named_patterns)
 
     def _ensure_resolved(self) -> None:
         if self._resolved:
             return
-        self._resolved = register_patterns(self._urlpatterns)
+        self._resolved = list(flatten(self._urlpatterns))
+        for pattern in self._resolved:
+            if pattern.full_name:
+                self._named_patterns[pattern.full_name] = pattern
+            if pattern.name and pattern.name not in self._named_patterns:
+                self._named_patterns[pattern.name] = pattern
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -276,7 +286,7 @@ class Application:
 
     def _make_handler(
         self, pattern: ResolvedPattern
-    ) -> tuple[Callable[..., Any], bool, Callable[..., Any]]:
+    ) -> tuple[Callable[..., Any], bool, Callable[..., Any], bool]:
         view = self._resolve_view(pattern.view)
         converters = pattern.converters
 
@@ -316,7 +326,10 @@ class Application:
         view_is_async = _is_view_async(view)
 
         if view_is_async or has_middleware:
-            chain = self._build_async_chain(call_view)
+            # The middleware chain is built once per application (see
+            # ``_get_chain``) so stateful middleware keeps a single instance,
+            # matching Django semantics.
+            chain = self._get_chain(call_view)
 
             async def async_handler(raw_request: Any, **kwargs: Any) -> Any:
                 request = HttpRequest(raw_request)
@@ -346,7 +359,7 @@ class Application:
                 return _ensure_response(response)
 
             async_handler.__alphaapi_async__ = True  # type: ignore[attr-defined]
-            return async_handler, True, view
+            return async_handler, True, view, view_wants_request
 
         def sync_handler(raw_request: Any, **kwargs: Any) -> Any:
             request = HttpRequest(raw_request)
@@ -368,7 +381,25 @@ class Application:
                     raise
                 return HttpResponseForbidden(str(error) or "Forbidden")
 
-        return sync_handler, False, view
+        return sync_handler, False, view, view_wants_request
+
+    def _get_chain(self, final: Callable[..., Any]) -> Callable[..., Any]:
+        """Return a memoized middleware chain ending in ``final``.
+
+        Middleware classes are instantiated exactly once per application, no
+        matter how many routes share the chain.  Stateful middleware (rate
+        limiters, caches, connection pools) therefore behaves like it does in
+        Django instead of being silently duplicated per route.
+        """
+        key = id(final)
+        cached = self._chains.get(key)
+        if cached is not None:
+            return cached[1]
+        handler = self._build_async_chain(final)
+        # Keep a strong reference to ``final`` alongside the chain so its
+        # ``id`` cannot be reused by another object while the chain lives.
+        self._chains[key] = (final, handler)
+        return handler
 
     def _build_async_chain(self, final: Callable[..., Any]) -> Callable[..., Any]:
         async def get_response(request: HttpRequest) -> Any:
@@ -389,19 +420,25 @@ class Application:
         pattern: ResolvedPattern,
         is_async: bool,
         view: Callable[..., Any],
+        wants_request: bool = True,
     ) -> dict[str, Any]:
-        params: list[dict[str, Any]] = [
-            {
-                "name": "request",
-                "alias": "request",
-                "kind": "request",
-                "type": "request",
-                "required": True,
-                "default": None,
-                "model": None,
-                "positional": True,
-            }
-        ]
+        params: list[dict[str, Any]] = []
+        if wants_request:
+            # Only views that actually declare a ``request`` parameter receive
+            # the raw request object.  Views without it keep the lazy hot path:
+            # no headers/query/body materialization in Rust (see README).
+            params.append(
+                {
+                    "name": "request",
+                    "alias": "request",
+                    "kind": "request",
+                    "type": "request",
+                    "required": True,
+                    "default": None,
+                    "model": None,
+                    "positional": True,
+                }
+            )
         # Path values are extracted as strings by Rust and converted by the
         # Django path converters in Python.  This keeps conversion semantics
         # (including custom converters) in one place and produces a 404 rather
@@ -429,18 +466,19 @@ class Application:
     def _ensure_registered(self) -> None:
         if self._registered:
             return
-        self._registered = True
+        # Only flip the guard flag *after* the work succeeds; otherwise a
+        # partial registration would be silently skipped on the next run().
         self._ensure_resolved()
         for pattern in self._resolved:
-            handler, is_async, view = self._make_handler(pattern)
-            spec = self._build_spec(pattern, is_async, view)
+            handler, is_async, view, wants_request = self._make_handler(pattern)
+            spec = self._build_spec(pattern, is_async, view, wants_request)
             for method in HTTP_METHODS:
                 self._core.add_route(method, pattern.router_path, handler, spec)
+        self._registered = True
 
     def _ensure_exception_handlers(self) -> None:
         if self._handlers_registered:
             return
-        self._handlers_registered = True
         self._core.set_http_exception_type(HTTPException)
         for exc_type, handler in self._exception_handlers.items():
             if is_async_callable(handler):
@@ -456,6 +494,7 @@ class Application:
                     return _handler(HttpRequest(raw_request), exception)
 
             self._core.add_exception_handler(exc_type, wrapped)
+        self._handlers_registered = True
 
     # -- running ------------------------------------------------------------
 

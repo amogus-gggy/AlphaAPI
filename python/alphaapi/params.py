@@ -112,7 +112,10 @@ def _unwrap_annotation(annotation: Any) -> Any:
         args = get_args(annotation)
         return _unwrap_annotation(args[0]) if args else annotation
 
-    if origin in (typing.Union, types.UnionType):
+    # ``types.UnionType`` (the ``X | Y`` runtime type) only exists on Python
+    # 3.10+; the package supports 3.9, so look it up defensively.
+    union_type = getattr(types, "UnionType", typing.Union)
+    if origin is typing.Union or origin is union_type:
         args = [arg for arg in get_args(annotation) if arg is not type(None)]
         if len(args) == 1:
             return _unwrap_annotation(args[0])
@@ -293,6 +296,10 @@ def build_param_specs(
         if kind == "header" and not (marker and marker.alias):
             alias = name.replace("_", "-")
 
+        # Positional-only parameters cannot be passed by keyword, so mark them
+        # for the Rust call layer to pass positionally after the request.
+        positional = parameter.kind is inspect.Parameter.POSITIONAL_ONLY
+
         specs.append(
             {
                 "name": name,
@@ -302,7 +309,7 @@ def build_param_specs(
                 "required": bool(required),
                 "default": None if default is _MISSING else default,
                 "model": model,
-                "positional": False,
+                "positional": positional,
             }
         )
     return specs
