@@ -115,6 +115,7 @@ struct RouteDef {
 struct ServerConfig {
     allowed_hosts: Vec<String>,
     trusted_proxies: Vec<String>,
+    trust_proxy_headers: bool,
     debug: bool,
     access_log_json: bool,
     security_headers: bool,
@@ -136,6 +137,7 @@ impl Default for ServerConfig {
         Self {
             allowed_hosts: vec!["*".to_string()],
             trusted_proxies: Vec::new(),
+            trust_proxy_headers: true,
             debug: false,
             access_log_json: false,
             security_headers: true,
@@ -201,6 +203,7 @@ impl ServerConfig {
         Ok(Self {
             allowed_hosts: config_strings(dict, "allowed_hosts", vec!["*".to_string()])?,
             trusted_proxies: config_strings(dict, "trusted_proxies", Vec::new())?,
+            trust_proxy_headers: config_bool(dict, "trust_proxy_headers", true)?,
             debug: config_bool(dict, "debug", false)?,
             access_log_json: config_bool(dict, "access_log_json", false)?,
             security_headers: config_bool(dict, "security_headers", true)?,
@@ -551,6 +554,9 @@ async fn serve(
                 let io = TokioIo::new(stream);
                 let state = state.clone();
                 let client = peer.ip();
+                // Snapshot of the security config for this connection, used
+                // by framework-generated early responses (see BuiltResponse).
+                let conn_config = state.config.clone();
 
                 tokio::spawn(async move {
                     let builder_state = state.clone();
@@ -562,9 +568,10 @@ async fn serve(
                                     Ok(permit) => Some(permit),
                                     Err(_) => {
                                         return Ok::<_, Infallible>(
-                                            BuiltResponse::static_json(
+                                            BuiltResponse::framework(
                                                 StatusCode::SERVICE_UNAVAILABLE,
                                                 SERVICE_UNAVAILABLE_BODY,
+                                                &builder_state.config,
                                             )
                                             .into_hyper(false),
                                         )
@@ -575,13 +582,14 @@ async fn serve(
                             };
                             let _permit = permit;
 
-                            let future = handle_request(request, state.clone(), client);
+                            let future = handle_request(request, state.clone(), client, conn_config.clone());
                             let response = if let Some(timeout) = state.config.request_timeout {
                                 match tokio::time::timeout(timeout, future).await {
                                     Ok(response) => response,
-                                    Err(_) => BuiltResponse::static_json(
+                                    Err(_) => BuiltResponse::framework(
                                         StatusCode::GATEWAY_TIMEOUT,
                                         GATEWAY_TIMEOUT_BODY,
+                                        &state.config,
                                     )
                                     .into_hyper(false),
                                 }
@@ -693,6 +701,7 @@ async fn handle_request(
     request: HyperRequest<Incoming>,
     state: Arc<ServerState>,
     client: IpAddr,
+    config: ServerConfig,
 ) -> HyperResponse<ResponseBody> {
     let started = Instant::now();
     let (parts, incoming) = request.into_parts();
@@ -710,16 +719,21 @@ async fn handle_request(
         .get(HOST)
         .and_then(|value| value.to_str().ok());
     if !host_allowed(host, &state.config.allowed_hosts) {
-        return BuiltResponse::static_json(StatusCode::BAD_REQUEST, BAD_REQUEST_BODY)
+        return BuiltResponse::framework(StatusCode::BAD_REQUEST, BAD_REQUEST_BODY, &config)
             .into_hyper(false);
     }
-    let client = effective_client(client, &parts.headers, &state.config.trusted_proxies);
+    let client = effective_client(
+        client,
+        &parts.headers,
+        &state.config.trusted_proxies,
+        state.config.trust_proxy_headers,
+    );
 
     // Route first, so we know exactly which request data the handler needs.
     let matched = match state.router.at(path) {
         Ok(matched) => matched,
         Err(_) => {
-            return BuiltResponse::static_json(StatusCode::NOT_FOUND, NOT_FOUND_BODY)
+            return BuiltResponse::framework(StatusCode::NOT_FOUND, NOT_FOUND_BODY, &config)
                 .into_hyper(false)
         }
     };
@@ -730,17 +744,21 @@ async fn handle_request(
     // Automatic OPTIONS response.
     if method == Method::OPTIONS && !methods.contains_key(&Method::OPTIONS) {
         let allow = allow_header(methods);
-        return BuiltResponse::empty(StatusCode::NO_CONTENT, vec![("allow".to_string(), allow)])
-            .into_hyper(false);
+        return BuiltResponse::framework_empty(
+            StatusCode::NO_CONTENT,
+            vec![("allow".to_string(), allow)],
+            &config,
+        )
+        .into_hyper(false);
     }
 
     let route_index = match methods.get(&method) {
         Some(index) => *index,
         None if method == Method::HEAD => match methods.get(&Method::GET) {
             Some(index) => *index,
-            None => return method_not_allowed(methods),
+            None => return method_not_allowed(methods, &config),
         },
-        None => return method_not_allowed(methods),
+        None => return method_not_allowed(methods, &config),
     };
 
     let spec = &state.routes[route_index].spec;
@@ -771,9 +789,10 @@ async fn handle_request(
             .and_then(|value| value.parse::<u64>().ok())
         {
             if length > state.max_body_size as u64 {
-                return BuiltResponse::static_json(
+                return BuiltResponse::framework(
                     StatusCode::PAYLOAD_TOO_LARGE,
                     PAYLOAD_TOO_LARGE_BODY,
+                    &config,
                 )
                 .into_hyper(false);
             }
@@ -794,10 +813,21 @@ async fn handle_request(
         // Drain in the background so the connection can be reused, but avoid
         // buffering data that no view or exception handler will inspect.
         if !incoming.is_end_stream() {
+            let max_size = state.max_body_size;
             tokio::spawn(async move {
                 let mut incoming = incoming;
+                // Discard the payload, but never read more than the
+                // configured body limit: an unbounded drain on a cheap
+                // route would be a bandwidth/CPU DoS vector.
+                let mut total = 0usize;
                 while let Some(frame) = incoming.frame().await {
-                    if frame.is_err() {
+                    match frame {
+                        Ok(frame) => {
+                            total += frame.into_data().map(Bytes::len).unwrap_or(0);
+                        }
+                        Err(_) => break,
+                    }
+                    if total > max_size {
                         break;
                     }
                 }
@@ -810,15 +840,20 @@ async fn handle_request(
         match read_body(incoming, state.max_body_size).await {
             Ok(body) => body,
             Err(BodyError::TooLarge) => {
-                return BuiltResponse::static_json(
+                return BuiltResponse::framework(
                     StatusCode::PAYLOAD_TOO_LARGE,
                     PAYLOAD_TOO_LARGE_BODY,
+                    &config,
                 )
                 .into_hyper(false)
             }
             Err(BodyError::Read) => {
-                return BuiltResponse::static_json(StatusCode::BAD_REQUEST, BAD_REQUEST_BODY)
-                    .into_hyper(false)
+                return BuiltResponse::framework(
+                    StatusCode::BAD_REQUEST,
+                    BAD_REQUEST_BODY,
+                    &config,
+                )
+                .into_hyper(false)
             }
         }
     };
@@ -862,6 +897,22 @@ async fn handle_request(
     response
 }
 
+/// Split a `Host` header value into its hostname, removing any port and
+/// bracket quoting so that IPv6 literals (`[::1]`, `[::1]:8000`) work.
+fn strip_host_port(host: &str) -> &str {
+    let host = host.trim();
+    if let Some(rest) = host.strip_prefix('[') {
+        // Bracketed IPv6 literal: the port (if present) follows `]`.
+        return rest.split(']').next().unwrap_or("");
+    }
+    // A bare colon can only introduce a port here (a raw IPv6 address must
+    // be bracketed in a Host header), so split at most once from the right.
+    match host.split_once(':') {
+        Some((name, _)) => name,
+        None => host,
+    }
+}
+
 fn host_allowed(host: Option<&str>, allowed_hosts: &[String]) -> bool {
     if allowed_hosts.iter().any(|pattern| pattern == "*") {
         return true;
@@ -869,12 +920,7 @@ fn host_allowed(host: Option<&str>, allowed_hosts: &[String]) -> bool {
     let Some(host) = host else {
         return false;
     };
-    let hostname = host
-        .rsplit_once(':')
-        .map(|(name, _)| name)
-        .unwrap_or(host)
-        .trim_matches(['[', ']'])
-        .to_ascii_lowercase();
+    let hostname = strip_host_port(host).to_ascii_lowercase();
     allowed_hosts.iter().any(|pattern| {
         let pattern = pattern.to_ascii_lowercase();
         if let Some(suffix) = pattern.strip_prefix('.') {
@@ -885,7 +931,18 @@ fn host_allowed(host: Option<&str>, allowed_hosts: &[String]) -> bool {
     })
 }
 
-fn effective_client(client: IpAddr, headers: &HeaderMap, trusted_proxies: &[String]) -> IpAddr {
+fn effective_client(
+    client: IpAddr,
+    headers: &HeaderMap,
+    trusted_proxies: &[String],
+    trust_proxy_headers: bool,
+) -> IpAddr {
+    // Proxy headers are only consulted when explicitly enabled; otherwise the
+    // peer address is authoritative even behind a trusted proxy (this matches
+    // HttpRequest.is_secure(), which already honors TRUST_PROXY_HEADERS).
+    if !trust_proxy_headers {
+        return client;
+    }
     let trusted = trusted_proxies.iter().any(|proxy| {
         proxy == "*"
             || proxy
@@ -980,11 +1037,18 @@ async fn read_body(mut body: Incoming, max_size: usize) -> Result<Bytes, BodyErr
     })
 }
 
-fn method_not_allowed(methods: &HashMap<Method, usize>) -> HyperResponse<ResponseBody> {
+fn method_not_allowed(
+    methods: &HashMap<Method, usize>,
+    config: &ServerConfig,
+) -> HyperResponse<ResponseBody> {
     let allow = allow_header(methods);
-    BuiltResponse::static_json(StatusCode::METHOD_NOT_ALLOWED, METHOD_NOT_ALLOWED_BODY)
-        .with_header("allow", allow)
-        .into_hyper(false)
+    BuiltResponse::framework(
+        StatusCode::METHOD_NOT_ALLOWED,
+        METHOD_NOT_ALLOWED_BODY,
+        config,
+    )
+    .with_header("allow", allow)
+    .into_hyper(false)
 }
 
 fn allow_header(methods: &HashMap<Method, usize>) -> String {
@@ -1847,6 +1911,13 @@ struct BuiltResponse {
     body: Bytes,
     stream: Option<ChannelBody>,
     media_type: Option<Cow<'static, str>>,
+    /// Security configuration captured at construction time.  When present,
+    /// `into_hyper` applies the security headers itself, so *every* response
+    /// path — including framework early returns such as host rejections,
+    /// router 404s, 405s and automatic OPTIONS — carries them.  Views that
+    /// build responses through Python do not set this field; those get the
+    /// headers applied in `handle_request` exactly as before.
+    security: Option<ServerConfig>,
 }
 
 impl BuiltResponse {
@@ -1857,6 +1928,7 @@ impl BuiltResponse {
             body,
             stream: None,
             media_type: Some(Cow::Borrowed("application/json")),
+            security: None,
         }
     }
 
@@ -1868,6 +1940,16 @@ impl BuiltResponse {
         Self::json(status, Bytes::from_static(body), Vec::new())
     }
 
+    /// Framework-generated response (404/405/413/503/…).  Carrying the
+    /// server config guarantees the security headers are applied even on
+    /// early-return paths that never reach the post-dispatch header pass.
+    fn framework(status: StatusCode, body: &'static [u8], config: &ServerConfig) -> Self {
+        Self {
+            security: Some(config.clone()),
+            ..Self::static_json(status, body)
+        }
+    }
+
     fn empty(status: StatusCode, headers: Vec<(String, String)>) -> Self {
         Self {
             status,
@@ -1875,6 +1957,14 @@ impl BuiltResponse {
             body: Bytes::new(),
             stream: None,
             media_type: None,
+            security: None,
+        }
+    }
+
+    fn framework_empty(status: StatusCode, headers: Vec<(String, String)>, config: &ServerConfig) -> Self {
+        Self {
+            security: Some(config.clone()),
+            ..Self::empty(status, headers)
         }
     }
 
@@ -1901,12 +1991,23 @@ impl BuiltResponse {
         } else {
             None
         };
+        let mut built = Self {
+            status: self.status,
+            headers: self.headers,
+            body: self.body,
+            stream: self.stream,
+            media_type: self.media_type,
+            security: None,
+        };
+        if let Some(config) = &self.security {
+            apply_security_headers(&mut built, config);
+        }
         let body = if head || no_body {
             ResponseBody::Full(Full::new(Bytes::new()))
         } else {
-            match self.stream {
+            match built.stream {
                 Some(channel) => ResponseBody::Channel(channel),
-                None => ResponseBody::Full(Full::new(self.body)),
+                None => ResponseBody::Full(Full::new(built.body)),
             }
         };
 
@@ -1914,7 +2015,7 @@ impl BuiltResponse {
         *response.status_mut() = status;
         let headers = response.headers_mut();
 
-        for (key, value) in &self.headers {
+        for (key, value) in &built.headers {
             if let (Ok(name), Ok(value)) = (
                 HeaderName::from_bytes(key.as_bytes()),
                 HeaderValue::from_str(value),
@@ -1924,7 +2025,7 @@ impl BuiltResponse {
         }
 
         if !headers.contains_key(CONTENT_TYPE) {
-            if let Some(media_type) = &self.media_type {
+            if let Some(media_type) = &built.media_type {
                 if let Ok(value) = HeaderValue::from_str(media_type.as_ref()) {
                     headers.insert(CONTENT_TYPE, value);
                 }

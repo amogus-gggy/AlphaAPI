@@ -306,10 +306,19 @@ def reverse(
     viewname: str,
     args: Iterable[Any] | None = None,
     kwargs: dict[str, Any] | None = None,
+    *,
+    registry: dict[str, Any] | None = None,
 ) -> str:
-    """Build a URL for a named pattern."""
+    """Build a URL for a named pattern.
+
+    ``registry`` lets callers (e.g. an :class:`alphaapi.Application`) look
+    names up in an application-scoped mapping instead of the process-global
+    one, so multiple applications in a single process cannot resolve each
+    other's routes.
+    """
+    table = _NAMED_PATTERNS if registry is None else registry
     try:
-        pattern = _NAMED_PATTERNS[viewname]
+        pattern = table[viewname]
     except KeyError as error:
         raise NoReverseMatch(f"no URL pattern named {viewname!r}") from error
 
