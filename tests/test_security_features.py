@@ -144,7 +144,7 @@ def test_trusted_proxy_headers(settings_override):
 
     settings_override(
         TRUST_PROXY_HEADERS=True,
-        TRUSTED_PROXIES=["127.0.0.1"],
+        TRUSTED_PROXIES=["127.0.0.1", "10.0.0.1"],
     )
     with Client(build()) as client:
         data = _json(

@@ -7,7 +7,6 @@ import sys
 import time
 
 import pytest
-
 from alphaapi import cli
 from alphaapi.cli import main
 from alphaapi.scaffold import ScaffoldError, startapp, startproject

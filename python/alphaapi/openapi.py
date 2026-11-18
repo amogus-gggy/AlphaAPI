@@ -44,11 +44,31 @@ def _openapi_path(django_path: str) -> str:
     return _CONVERTER_RE.sub(lambda match: "{" + match.group("name") + "}", django_path)
 
 
+def _view_methods(view: Any) -> list[str]:
+    """Return the HTTP methods a view actually handles, lowercased."""
+    view_class = getattr(view, "view_class", None)
+    if view_class is not None:
+        names = getattr(view_class, "http_method_names", [])
+        methods = [
+            name
+            for name in names
+            if name not in {"head", "trace"} and hasattr(view_class, name)
+        ]
+        # The base View supplies ``options``; keep it when callers override it
+        # or when the class inherits the default implementation.
+        if "options" not in methods and hasattr(view_class, "options"):
+            methods.append("options")
+        return methods or ["get"]
+
+    return ["get", "post", "put", "patch", "delete", "options"]
+
+
 def build_openapi(app: Any) -> dict[str, Any]:
     """Build an OpenAPI 3 document from an ``Application``."""
     app._ensure_resolved()
     components: dict[str, Any] = {}
     paths: dict[str, dict[str, Any]] = {}
+    operation_ids: set[str] = set()
 
     for pattern in app._resolved:
         try:
@@ -96,24 +116,39 @@ def build_openapi(app: Any) -> dict[str, Any]:
                     "content": {"application/json": {"schema": schema}},
                 }
 
-        method_names = ["get", "post", "put", "patch", "delete", "options"]
-        operation = {
-            "operationId": pattern.full_name or f"{method_names[0]}_{pattern.django_path}",
-            "parameters": parameters,
-            "responses": {
-                "200": {
-                    "description": "Successful response",
-                    "content": {"application/json": {"schema": {"type": "object"}}},
-                }
-            },
-        }
-        if request_body is not None:
-            operation["requestBody"] = request_body
-
+        method_names = _view_methods(view)
+        base_name = (
+            pattern.full_name
+            or pattern.name
+            or _openapi_path(pattern.django_path).strip("/").replace("/", "_")
+            or "root"
+        )
         path = "/" + _openapi_path(pattern.django_path).lstrip("/")
         entry = paths.setdefault(path, {})
         for method_name in method_names:
-            entry[method_name] = dict(operation)
+            operation_id = f"{base_name}_{method_name}"
+            suffix = 2
+            while operation_id in operation_ids:
+                operation_id = f"{base_name}_{method_name}_{suffix}"
+                suffix += 1
+            operation_ids.add(operation_id)
+            operation = {
+                # Operation IDs must be unique per operation; using the method
+                # name also keeps generated clients from sharing one operation.
+                "operationId": operation_id,
+                "parameters": parameters,
+                "responses": {
+                    "200": {
+                        "description": "Successful response",
+                        "content": {
+                            "application/json": {"schema": {"type": "object"}}
+                        },
+                    }
+                },
+            }
+            if request_body is not None:
+                operation["requestBody"] = request_body
+            entry[method_name] = operation
 
     title = (
         getattr(app.settings, "OPENAPI_TITLE", None)
@@ -132,8 +167,13 @@ def build_openapi(app: Any) -> dict[str, Any]:
 
 
 def openapi_view(app: Any) -> Any:
+    cached: dict[str, Any] | None = None
+
     def view(request: Any) -> JsonResponse:
-        return JsonResponse(build_openapi(app))
+        nonlocal cached
+        if cached is None:
+            cached = build_openapi(app)
+        return JsonResponse(cached)
 
     return view
 

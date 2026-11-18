@@ -13,7 +13,7 @@ async def search(
     q: str,
     limit: int = 10,
     ratio: float = 1.0,
-    tags: list[str] = Query(default=[]),
+    tags: list[str] = Query(default=None),
     x_api_key: str = Header(...),
 ):
     return JsonResponse({
@@ -71,12 +71,14 @@ async def list_items(
     q: str | None = None,
     limit: int = 20,
     active: bool = True,
-    tags: list[str] = Query(default=[]),
+    tags: list[str] = Query(default=None),
 ):
     ...
 ```
 
-Repeated query keys become a `list[str]`:
+Mutable defaults such as `Query(default=[])` are shallow-copied per request,
+but `None` is still the clearest way to express "not supplied". Repeated query
+keys become a `list[str]`:
 
 ```text
 /items/?tag=python&tag=rust

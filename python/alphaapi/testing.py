@@ -11,9 +11,10 @@ import json as json_module
 import socket
 import threading
 import time
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from http.cookies import SimpleCookie
-from typing import Any, Iterator, Mapping
+from typing import Any
 
 
 def _free_port() -> int:
@@ -56,22 +57,34 @@ class Client:
     def _start(self) -> None:
         if self._thread is not None:
             return
-        self.port = _free_port()
-        self._thread = threading.Thread(
-            target=self.app.run,
-            kwargs={"host": self.host, "port": self.port},
-            daemon=True,
-            name="alphaapi-test-client",
-        )
-        self._thread.start()
 
-        deadline = time.time() + self.timeout
-        while time.time() < deadline:
-            try:
-                with socket.create_connection((self.host, self.port), timeout=0.1):
-                    return
-            except OSError:
-                time.sleep(0.01)
+        # Releasing a probed port and then binding it is inherently racy when
+        # several clients start in parallel.  Retry with a fresh port instead
+        # of failing the test run.
+        for _ in range(5):
+            self.port = _free_port()
+            self._thread = threading.Thread(
+                target=self.app.run,
+                kwargs={"host": self.host, "port": self.port},
+                daemon=True,
+                name="alphaapi-test-client",
+            )
+            self._thread.start()
+
+            deadline = time.time() + self.timeout
+            while time.time() < deadline:
+                if not self._thread.is_alive():
+                    break
+                try:
+                    with socket.create_connection((self.host, self.port), timeout=0.1):
+                        return
+                except OSError:
+                    time.sleep(0.01)
+
+            self.app.stop()
+            self._thread.join(timeout=self.timeout)
+            self._thread = None
+
         raise RuntimeError("test server did not start")
 
     def close(self) -> None:
@@ -82,7 +95,7 @@ class Client:
         self._thread = None
         self.port = None
 
-    def __enter__(self) -> "Client":
+    def __enter__(self) -> Client:
         self._start()
         return self
 
@@ -150,6 +163,10 @@ class Client:
                     self._cookies.pop(name, None)
         for key, value in response.getheaders():
             lowered = key.lower()
+            if lowered == "set-cookie" and lowered in response_headers:
+                # Set-Cookie is not a comma-joinable field.  Keep the first
+                # value; cookies are tracked separately in the client jar.
+                continue
             response_headers[lowered] = (
                 f"{response_headers[lowered]}, {value}"
                 if lowered in response_headers

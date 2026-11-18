@@ -8,13 +8,28 @@ from .http import HttpResponsePermanentRedirect
 from .middleware import call_next
 
 
+def _host_name(host: str) -> str:
+    """Strip an optional port from a Host value, including bracketed IPv6."""
+    host = host.strip()
+    if host.startswith("["):
+        # ``[::1]`` or ``[::1]:8000``.  An IPv6 literal without brackets has no
+        # port, so never split on the colons inside the address.
+        end = host.find("]")
+        name = host[1:end] if end != -1 else host[1:]
+    elif host.count(":") == 1:
+        name = host.rsplit(":", 1)[0]
+    else:
+        name = host
+    return name.rstrip(".").lower()
+
+
 def host_is_allowed(host: str, allowed_hosts: list[str] | tuple[str, ...]) -> bool:
     """Return whether ``host`` (with optional port) matches ``ALLOWED_HOSTS``."""
     if not allowed_hosts:
         return False
-    hostname = host.rsplit(":", 1)[0].strip("[]").lower()
+    hostname = _host_name(host)
     for pattern in allowed_hosts:
-        candidate = str(pattern).lower()
+        candidate = str(pattern).lower().rstrip(".")
         if candidate == "*":
             return True
         if candidate.startswith("."):

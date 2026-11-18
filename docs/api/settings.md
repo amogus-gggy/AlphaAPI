@@ -46,6 +46,7 @@ settings.configure(DEBUG=True, TITLE="Scratch")
 | `ROOT_URLCONF` | `None` |
 | `DEFAULT_CHARSET` | `"utf-8"` |
 | `MAX_BODY_SIZE` | `16 MiB` |
+| `MAX_UPLOAD_SIZE` | `16 MiB` |
 | `ACCESS_LOG` | `False` |
 | `ACCESS_LOG_JSON` | `False` |
 | `TITLE` | `"AlphaAPI"` |
@@ -76,8 +77,9 @@ See [Security](security.md) for host validation, CORS, CSRF, and signed cookies.
 | `OFFLOAD_SYNC_VIEWS` | `False` |
 
 `REQUEST_TIMEOUT` is in seconds. `MAX_CONCURRENT_REQUESTS` caps in-flight
-requests. `OFFLOAD_SYNC_VIEWS` moves blocking sync views off the Tokio worker
-threads.
+requests: excess requests are rejected immediately with `503 Service
+Unavailable` (admission control, not queueing). `OFFLOAD_SYNC_VIEWS` moves
+blocking sync views off the Tokio worker threads.
 
 ### HTTP/2
 

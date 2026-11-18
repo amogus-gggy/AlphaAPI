@@ -7,8 +7,9 @@ same idea, without models or an ORM: an app is a package that may expose an
 from __future__ import annotations
 
 import importlib
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 
 class AppConfig:
@@ -48,11 +49,30 @@ class AppRegistry:
     def __init__(self) -> None:
         self.app_configs: dict[str, AppConfig] = {}
         self._populated = False
+        self._installed: list[Any] = []
 
     def populate(self, installed_apps: Iterable[Any] | None = None) -> None:
-        if self._populated:
+        """Populate the registry, reconfiguring it when the app list changes.
+
+        Calling ``populate`` again with the same entries is a no-op.  A
+        different list replaces the previous configuration, which keeps
+        independent applications in one process from silently sharing the
+        first registry that happened to be built.
+        """
+        if installed_apps is None:
+            if self._populated:
+                return
+            entries: list[Any] = []
+        else:
+            entries = list(installed_apps)
+
+        if self._populated and entries == self._installed:
             return
-        for entry in installed_apps or []:
+        if self._populated:
+            self.app_configs.clear()
+
+        self._installed = entries
+        for entry in entries:
             self.register(entry)
         for config in self.app_configs.values():
             config.ready()

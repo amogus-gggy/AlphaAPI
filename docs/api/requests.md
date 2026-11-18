@@ -1,7 +1,9 @@
 # Requests
 
-Every view receives an `HttpRequest`. It exposes parsed query parameters, form
-data, uploaded files, cookies, headers, and the raw body.
+Views that declare a request receive an `HttpRequest`. It exposes parsed query
+parameters, form data, uploaded files, cookies, headers, and the raw body.
+Query/form/cookie metadata is computed lazily on first access, and views that
+omit the request entirely avoid materialising it in the core at all.
 
 ```python
 async def inspect(request):

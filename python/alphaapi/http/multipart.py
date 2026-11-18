@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import io
+from collections.abc import Iterator
 from email.parser import BytesParser
 from email.policy import HTTP
-from typing import Any, Iterator
+from typing import Any
+
+from ..exceptions import HTTPException
 
 
 class UploadedFile:
@@ -65,11 +68,15 @@ class UploadedFile:
 def parse_multipart(
     body: bytes,
     content_type: str,
+    *,
+    max_file_size: int | None = None,
 ) -> tuple[list[tuple[str, str]], dict[str, list[UploadedFile]]]:
     """Return ``(text_fields, files)`` for a multipart payload.
 
     ``text_fields`` is a list of ``(name, value)`` pairs so repeated form fields
-    can be preserved.  Files are grouped by field name.
+    can be preserved.  Files are grouped by field name.  When ``max_file_size``
+    is set, an oversized file part raises a ``413`` :class:`HTTPException`
+    instead of being buffered without limit.
     """
     if "multipart/form-data" not in content_type.lower():
         return [], {}
@@ -99,6 +106,8 @@ def parse_multipart(
         charset = part.get_content_charset() or "utf-8"
 
         if filename is not None:
+            if max_file_size is not None and len(payload) > max_file_size:
+                raise HTTPException(413, "Uploaded file too large")
             uploaded = UploadedFile(
                 name=name,
                 filename=filename,

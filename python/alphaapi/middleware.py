@@ -33,8 +33,9 @@ class MiddlewareMixin:
 def is_async_callable(value: Any) -> bool:
     if inspect.iscoroutinefunction(value):
         return True
-    call = getattr(value, "__call__", None)
-    return call is not None and inspect.iscoroutinefunction(call)
+    if not callable(value):
+        return False
+    return inspect.iscoroutinefunction(value.__call__)
 
 
 async def call_next(get_response: Callable[..., Any], request: Any) -> Any:

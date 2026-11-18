@@ -3,7 +3,6 @@ from __future__ import annotations
 
 from . import __version__
 
-
 _WELCOME_PAGE = """<!DOCTYPE html>
 <html lang="en">
 <head>

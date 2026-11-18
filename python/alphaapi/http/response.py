@@ -8,11 +8,11 @@ from __future__ import annotations
 import json
 import mimetypes
 import os
-import shlex
-from collections.abc import AsyncIterable, Iterable, Iterator, MutableMapping
+from collections.abc import AsyncIterable, Iterable, Iterator, Mapping, MutableMapping
 from email.utils import formatdate, parsedate_to_datetime
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
+from urllib.parse import quote
 
 from .._core import Response, dumps
 from .._helpers import to_builtin
@@ -34,7 +34,7 @@ class Headers(MutableMapping[str, str]):
     as multiple ``Set-Cookie`` headers.
     """
 
-    def __init__(self, response: "HttpResponse") -> None:
+    def __init__(self, response: HttpResponse) -> None:
         self._response = response
 
     def __getitem__(self, key: str) -> str:
@@ -89,7 +89,7 @@ class HttpResponse(Response):
 
     status_code_default = 200
 
-    def __new__(cls, *args: Any, **kwargs: Any) -> "HttpResponse":
+    def __new__(cls, *args: Any, **kwargs: Any) -> HttpResponse:
         # The Rust base type has its own ``__new__`` with a narrower signature;
         # Django-style constructor keywords (``status``, ``content_type``, ...)
         # are handled by ``__init__`` below.
@@ -275,6 +275,16 @@ class StreamingHttpResponse(HttpResponse):
         return iter(self.streaming_content)
 
 
+def _content_disposition(filename: str) -> str:
+    """Build a valid ``Content-Disposition`` value for a download."""
+    ascii_name = filename.encode("ascii", "ignore").decode("ascii") or "download"
+    ascii_name = ascii_name.replace("\\", "\\\\").replace('"', '\\"')
+    value = f'attachment; filename="{ascii_name}"'
+    if any(ord(character) > 127 for character in filename):
+        value += f"; filename*=UTF-8''{quote(filename, safe='')}"
+    return value
+
+
 class FileResponse(StreamingHttpResponse):
     """Stream a file from disk without loading it into memory.
 
@@ -338,10 +348,7 @@ class FileResponse(StreamingHttpResponse):
             merged.setdefault("Content-Length", str(self._length))
         if as_attachment:
             name = filename or self.path.name
-            merged.setdefault(
-                "Content-Disposition",
-                f"attachment; filename={shlex.quote(name)}",
-            )
+            merged.setdefault("Content-Disposition", _content_disposition(name))
 
         super().__init__(
             self._iter_file(chunk_size),

@@ -9,6 +9,7 @@ from __future__ import annotations
 import secrets
 import threading
 import time
+import warnings
 from typing import Any
 
 from .conf import settings
@@ -19,7 +20,7 @@ from .signed_cookies import dumps, loads
 class Session(dict):
     """A mutable session mapping."""
 
-    def __init__(self, store: "SessionStore", key: str | None = None) -> None:
+    def __init__(self, store: SessionStore, key: str | None = None) -> None:
         super().__init__()
         self.store = store
         self.session_key = key
@@ -136,6 +137,13 @@ class SessionMiddleware:
     def __init__(self, get_response: Any, store: SessionStore | None = None) -> None:
         self.get_response = get_response
         self.store = store or _default_store
+        if not str(getattr(settings, "SECRET_KEY", "") or ""):
+            warnings.warn(
+                "SessionMiddleware is enabled but SECRET_KEY is empty; "
+                "session identifiers are not signed.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
     async def __call__(self, request: Any) -> Any:
         cookie_name = str(getattr(settings, "SESSION_COOKIE_NAME", "sessionid"))

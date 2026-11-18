@@ -6,6 +6,7 @@ user object.
 """
 from __future__ import annotations
 
+import inspect
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -65,6 +66,8 @@ class AuthenticationMiddleware:
         user = None
         if self.resolver is not None:
             user = self.resolver(request)
+            if inspect.isawaitable(user):
+                user = await user
         request.user = user if user is not None else AnonymousUser()
         return await call_next(self.get_response, request)
 
@@ -73,6 +76,10 @@ def login(request: Any, user: Any) -> None:
     session = getattr(request, "session", None)
     if session is None:
         raise RuntimeError("login() requires SessionMiddleware")
+    # Rotate the session identifier on privilege change to prevent fixation.
+    cycle_key = getattr(session, "cycle_key", None)
+    if cycle_key is not None:
+        cycle_key()
     session["_auth_user_id"] = getattr(user, "user_id", getattr(user, "pk", None))
     session["_auth_username"] = getattr(user, "username", str(user))
     session.modified = True

@@ -115,6 +115,7 @@ struct RouteDef {
 struct ServerConfig {
     allowed_hosts: Vec<String>,
     trusted_proxies: Vec<String>,
+    trust_proxy_headers: bool,
     debug: bool,
     access_log_json: bool,
     security_headers: bool,
@@ -136,6 +137,7 @@ impl Default for ServerConfig {
         Self {
             allowed_hosts: vec!["*".to_string()],
             trusted_proxies: Vec::new(),
+            trust_proxy_headers: false,
             debug: false,
             access_log_json: false,
             security_headers: true,
@@ -201,6 +203,7 @@ impl ServerConfig {
         Ok(Self {
             allowed_hosts: config_strings(dict, "allowed_hosts", vec!["*".to_string()])?,
             trusted_proxies: config_strings(dict, "trusted_proxies", Vec::new())?,
+            trust_proxy_headers: config_bool(dict, "trust_proxy_headers", false)?,
             debug: config_bool(dict, "debug", false)?,
             access_log_json: config_bool(dict, "access_log_json", false)?,
             security_headers: config_bool(dict, "security_headers", true)?,
@@ -346,6 +349,7 @@ impl AppCore {
     }
 
     #[pyo3(signature = (host = "127.0.0.1", port = 8000, workers = None, max_body_size = None, access_log = None, config = None))]
+    #[allow(clippy::too_many_arguments)]
     fn run(
         &self,
         py: Python<'_>,
@@ -386,6 +390,7 @@ impl AppCore {
 }
 
 impl AppCore {
+    #[allow(clippy::too_many_arguments)]
     fn run_inner(
         &self,
         py: Python<'_>,
@@ -561,13 +566,12 @@ async fn serve(
                                 match semaphore.clone().try_acquire_owned() {
                                     Ok(permit) => Some(permit),
                                     Err(_) => {
-                                        return Ok::<_, Infallible>(
-                                            BuiltResponse::static_json(
-                                                StatusCode::SERVICE_UNAVAILABLE,
-                                                SERVICE_UNAVAILABLE_BODY,
-                                            )
-                                            .into_hyper(false),
-                                        )
+                                        let mut built = BuiltResponse::static_json(
+                                            StatusCode::SERVICE_UNAVAILABLE,
+                                            SERVICE_UNAVAILABLE_BODY,
+                                        );
+                                        apply_security_headers(&mut built, &state.config);
+                                        return Ok::<_, Infallible>(built.into_hyper(false));
                                     }
                                 }
                             } else {
@@ -579,11 +583,14 @@ async fn serve(
                             let response = if let Some(timeout) = state.config.request_timeout {
                                 match tokio::time::timeout(timeout, future).await {
                                     Ok(response) => response,
-                                    Err(_) => BuiltResponse::static_json(
-                                        StatusCode::GATEWAY_TIMEOUT,
-                                        GATEWAY_TIMEOUT_BODY,
-                                    )
-                                    .into_hyper(false),
+                                    Err(_) => {
+                                        let mut built = BuiltResponse::static_json(
+                                            StatusCode::GATEWAY_TIMEOUT,
+                                            GATEWAY_TIMEOUT_BODY,
+                                        );
+                                        apply_security_headers(&mut built, &state.config);
+                                        built.into_hyper(false)
+                                    }
                                 }
                             } else {
                                 future.await
@@ -695,32 +702,70 @@ async fn handle_request(
     client: IpAddr,
 ) -> HyperResponse<ResponseBody> {
     let started = Instant::now();
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
+    let log_path = state.access_log.then(|| path.clone());
+
+    // All response paths (including host rejection, 404/405/OPTIONS and
+    // timeouts handled by the caller) go through ``apply_security_headers``.
+    let mut built = route_request(request, state.clone(), client).await;
+    apply_security_headers(&mut built, &state.config);
+    let status = built.status;
+    let is_head = method == Method::HEAD;
+    let response = built.into_hyper(is_head);
+
+    if state.access_log {
+        let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+        if state.config.access_log_json {
+            eprintln!(
+                "{{\"method\":\"{}\",\"path\":\"{}\",\"status\":{},\"duration_ms\":{:.2}}}",
+                method,
+                escape_log(log_path.as_deref().unwrap_or("")),
+                status.as_u16(),
+                elapsed
+            );
+        } else {
+            eprintln!(
+                "{} {} {} {:.2}ms",
+                method,
+                log_path.as_deref().unwrap_or(""),
+                status.as_u16(),
+                elapsed
+            );
+        }
+    }
+    response
+}
+
+async fn route_request(
+    request: HyperRequest<Incoming>,
+    state: Arc<ServerState>,
+    client: IpAddr,
+) -> BuiltResponse {
     let (parts, incoming) = request.into_parts();
     let method = parts.method;
     let path = parts.uri.path();
     let query = parts.uri.query().unwrap_or("");
-    let log_path = if state.access_log {
-        Some(path.to_string())
-    } else {
-        None
-    };
 
     let host = parts
         .headers
         .get(HOST)
         .and_then(|value| value.to_str().ok());
     if !host_allowed(host, &state.config.allowed_hosts) {
-        return BuiltResponse::static_json(StatusCode::BAD_REQUEST, BAD_REQUEST_BODY)
-            .into_hyper(false);
+        return BuiltResponse::static_json(StatusCode::BAD_REQUEST, BAD_REQUEST_BODY);
     }
-    let client = effective_client(client, &parts.headers, &state.config.trusted_proxies);
+    let client = effective_client(
+        client,
+        &parts.headers,
+        &state.config.trusted_proxies,
+        state.config.trust_proxy_headers,
+    );
 
     // Route first, so we know exactly which request data the handler needs.
     let matched = match state.router.at(path) {
         Ok(matched) => matched,
         Err(_) => {
-            return BuiltResponse::static_json(StatusCode::NOT_FOUND, NOT_FOUND_BODY)
-                .into_hyper(false)
+            return BuiltResponse::static_json(StatusCode::NOT_FOUND, NOT_FOUND_BODY);
         }
     };
     let path_id = *matched.value;
@@ -730,8 +775,7 @@ async fn handle_request(
     // Automatic OPTIONS response.
     if method == Method::OPTIONS && !methods.contains_key(&Method::OPTIONS) {
         let allow = allow_header(methods);
-        return BuiltResponse::empty(StatusCode::NO_CONTENT, vec![("allow".to_string(), allow)])
-            .into_hyper(false);
+        return BuiltResponse::empty(StatusCode::NO_CONTENT, vec![("allow".to_string(), allow)]);
     }
 
     let route_index = match methods.get(&method) {
@@ -763,21 +807,15 @@ async fn handle_request(
     };
 
     // Reject oversized payloads from Content-Length without reading a frame.
-    if needs_body {
-        if let Some(length) = parts
-            .headers
-            .get(CONTENT_LENGTH)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.parse::<u64>().ok())
-        {
-            if length > state.max_body_size as u64 {
-                return BuiltResponse::static_json(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    PAYLOAD_TOO_LARGE_BODY,
-                )
-                .into_hyper(false);
-            }
-        }
+    // The same limit applies when discarding a body for a route that does not
+    // need it, so a cheap route cannot be used to stream an unbounded upload.
+    let content_length = parts
+        .headers
+        .get(CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    if content_length.is_some_and(|length| length > state.max_body_size as u64) {
+        return BuiltResponse::static_json(StatusCode::PAYLOAD_TOO_LARGE, PAYLOAD_TOO_LARGE_BODY);
     }
 
     // Only materialize the pieces the route actually asked for.
@@ -791,17 +829,11 @@ async fn handle_request(
     };
 
     let body = if !needs_body {
-        // Drain in the background so the connection can be reused, but avoid
-        // buffering data that no view or exception handler will inspect.
+        // Drain in the background so the connection can be reused, but cap the
+        // discarded bytes as well as avoiding buffering them.
         if !incoming.is_end_stream() {
-            tokio::spawn(async move {
-                let mut incoming = incoming;
-                while let Some(frame) = incoming.frame().await {
-                    if frame.is_err() {
-                        break;
-                    }
-                }
-            });
+            let max_size = state.max_body_size;
+            tokio::spawn(drain_body(incoming, max_size));
         }
         Bytes::new()
     } else if incoming.is_end_stream() {
@@ -814,11 +846,9 @@ async fn handle_request(
                     StatusCode::PAYLOAD_TOO_LARGE,
                     PAYLOAD_TOO_LARGE_BODY,
                 )
-                .into_hyper(false)
             }
             Err(BodyError::Read) => {
                 return BuiltResponse::static_json(StatusCode::BAD_REQUEST, BAD_REQUEST_BODY)
-                    .into_hyper(false)
             }
         }
     };
@@ -834,32 +864,25 @@ async fn handle_request(
         body,
     };
 
-    let is_head = method == Method::HEAD;
-    let mut built = dispatch(state.clone(), route_index, request_data).await;
-    apply_security_headers(&mut built, &state.config);
-    let status = built.status;
-    let response = built.into_hyper(is_head);
-    if state.access_log {
-        let elapsed = started.elapsed().as_secs_f64() * 1000.0;
-        if state.config.access_log_json {
-            eprintln!(
-                "{{\"method\":\"{}\",\"path\":\"{}\",\"status\":{},\"duration_ms\":{:.2}}}",
-                method,
-                escape_log(log_path.as_deref().unwrap_or("")),
-                status.as_u16(),
-                elapsed
-            );
-        } else {
-            eprintln!(
-                "{} {} {} {:.2}ms",
-                method,
-                log_path.as_deref().unwrap_or(""),
-                status.as_u16(),
-                elapsed
-            );
+    dispatch(state, route_index, request_data).await
+}
+
+fn host_name(host: &str) -> String {
+    let host = host.trim();
+    let name = if let Some(rest) = host.strip_prefix('[') {
+        // ``[::1]`` or ``[::1]:8000``.  Never split inside an IPv6 literal.
+        match rest.split_once(']') {
+            Some((address, _)) => address,
+            None => rest,
         }
-    }
-    response
+    } else if host.matches(':').count() == 1 {
+        host.rsplit_once(':').map(|(name, _)| name).unwrap_or(host)
+    } else {
+        // More than one colon means an unbracketed IPv6 address, which cannot
+        // carry a port in a Host header.
+        host
+    };
+    name.trim_end_matches('.').to_ascii_lowercase()
 }
 
 fn host_allowed(host: Option<&str>, allowed_hosts: &[String]) -> bool {
@@ -869,14 +892,9 @@ fn host_allowed(host: Option<&str>, allowed_hosts: &[String]) -> bool {
     let Some(host) = host else {
         return false;
     };
-    let hostname = host
-        .rsplit_once(':')
-        .map(|(name, _)| name)
-        .unwrap_or(host)
-        .trim_matches(['[', ']'])
-        .to_ascii_lowercase();
+    let hostname = host_name(host);
     allowed_hosts.iter().any(|pattern| {
-        let pattern = pattern.to_ascii_lowercase();
+        let pattern = pattern.trim_end_matches('.').to_ascii_lowercase();
         if let Some(suffix) = pattern.strip_prefix('.') {
             hostname == suffix || hostname.ends_with(&pattern)
         } else {
@@ -885,25 +903,45 @@ fn host_allowed(host: Option<&str>, allowed_hosts: &[String]) -> bool {
     })
 }
 
-fn effective_client(client: IpAddr, headers: &HeaderMap, trusted_proxies: &[String]) -> IpAddr {
-    let trusted = trusted_proxies.iter().any(|proxy| {
+fn ip_is_trusted(ip: IpAddr, trusted_proxies: &[String]) -> bool {
+    trusted_proxies.iter().any(|proxy| {
         proxy == "*"
             || proxy
                 .parse::<IpAddr>()
-                .map(|ip| ip == client)
+                .map(|value| value == ip)
                 .unwrap_or(false)
-    });
-    if trusted {
-        if let Some(forwarded) = headers
-            .get("x-forwarded-for")
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.split(',').next())
-            .and_then(|value| value.trim().parse::<IpAddr>().ok())
-        {
-            return forwarded;
+    })
+}
+
+fn effective_client(
+    client: IpAddr,
+    headers: &HeaderMap,
+    trusted_proxies: &[String],
+    trust_proxy_headers: bool,
+) -> IpAddr {
+    if !trust_proxy_headers || !ip_is_trusted(client, trusted_proxies) {
+        return client;
+    }
+    let Some(forwarded) = headers
+        .get("x-forwarded-for")
+        .and_then(|value| value.to_str().ok())
+    else {
+        return client;
+    };
+
+    // Walk from the nearest hop outwards and return the first address that is
+    // not itself a trusted proxy.  Taking the leftmost value blindly lets any
+    // upstream that appends (rather than overwrites) spoof the client address.
+    let hops: Vec<IpAddr> = forwarded
+        .split(',')
+        .filter_map(|value| value.trim().parse::<IpAddr>().ok())
+        .collect();
+    for hop in hops.iter().rev() {
+        if !ip_is_trusted(*hop, trusted_proxies) {
+            return *hop;
         }
     }
-    client
+    hops.first().copied().unwrap_or(client)
 }
 
 fn apply_security_headers(response: &mut BuiltResponse, config: &ServerConfig) {
@@ -980,11 +1018,28 @@ async fn read_body(mut body: Incoming, max_size: usize) -> Result<Bytes, BodyErr
     })
 }
 
-fn method_not_allowed(methods: &HashMap<Method, usize>) -> HyperResponse<ResponseBody> {
+/// Consume and discard a request body without buffering it, stopping once the
+/// configured body limit is exceeded.  Dropping the remaining frame stream lets
+/// hyper close or reset the connection instead of reading forever.
+async fn drain_body(mut body: Incoming, max_size: usize) {
+    let mut total = 0usize;
+    while let Some(frame) = body.frame().await {
+        let Ok(frame) = frame else {
+            break;
+        };
+        if let Ok(data) = frame.into_data() {
+            total = total.saturating_add(data.len());
+            if total > max_size {
+                break;
+            }
+        }
+    }
+}
+
+fn method_not_allowed(methods: &HashMap<Method, usize>) -> BuiltResponse {
     let allow = allow_header(methods);
     BuiltResponse::static_json(StatusCode::METHOD_NOT_ALLOWED, METHOD_NOT_ALLOWED_BODY)
         .with_header("allow", allow)
-        .into_hyper(false)
 }
 
 fn allow_header(methods: &HashMap<Method, usize>) -> String {
@@ -1102,6 +1157,7 @@ impl From<PyErr> for CallError {
     }
 }
 
+#[allow(clippy::result_large_err)]
 async fn dispatch(
     state: Arc<ServerState>,
     route_index: usize,
@@ -1331,6 +1387,20 @@ fn call_handler(
         .map_err(CallError::Python)
 }
 
+/// Return a fresh value for a default.  Container defaults are shallow-copied
+/// so ``Query(default=[])`` cannot accumulate values across requests.
+fn clone_default(py: Python<'_>, value: &Py<PyAny>) -> Py<PyAny> {
+    let bound = value.bind(py);
+    if bound.is_instance_of::<PyList>() || bound.is_instance_of::<PyDict>() {
+        if let Ok(copied) = bound.call_method0("copy") {
+            return copied.unbind();
+        }
+    } else if let Ok(bytes) = bound.cast::<PyByteArray>() {
+        return PyByteArray::new(py, &bytes.to_vec()).into_any().unbind();
+    }
+    value.clone_ref(py)
+}
+
 fn missing_value(py: Python<'_>, param: &ParamSpec) -> Result<Py<PyAny>, CallError> {
     if param.required {
         Err(CallError::Validation(ValidationFailure::missing(param)))
@@ -1338,7 +1408,7 @@ fn missing_value(py: Python<'_>, param: &ParamSpec) -> Result<Py<PyAny>, CallErr
         Ok(param
             .default
             .as_ref()
-            .map(|value| value.clone_ref(py))
+            .map(|value| clone_default(py, value))
             .unwrap_or_else(|| py.None()))
     }
 }
@@ -1945,5 +2015,61 @@ impl BuiltResponse {
         }
 
         response
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_matching_handles_ports_ipv6_and_trailing_dots() {
+        let allowed = vec!["example.com".to_string(), "::1".to_string()];
+        assert!(host_allowed(Some("example.com"), &allowed));
+        assert!(host_allowed(Some("example.com:8000"), &allowed));
+        assert!(host_allowed(Some("example.com."), &allowed));
+        assert!(host_allowed(Some("[::1]"), &allowed));
+        assert!(host_allowed(Some("[::1]:8000"), &allowed));
+        assert!(!host_allowed(Some("[::2]"), &allowed));
+        assert!(host_allowed(Some("anything"), &["*".to_string()]));
+    }
+
+    #[test]
+    fn subdomain_patterns_match_suffixes() {
+        let allowed = vec![".example.com".to_string()];
+        assert!(host_allowed(Some("example.com"), &allowed));
+        assert!(host_allowed(Some("api.example.com"), &allowed));
+        assert!(!host_allowed(Some("evil-example.com"), &allowed));
+    }
+
+    #[test]
+    fn proxy_headers_are_gated_and_use_rightmost_untrusted_hop() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("203.0.113.9, 10.0.0.2, 10.0.0.3"),
+        );
+        let proxies = vec!["10.0.0.2".to_string(), "10.0.0.3".to_string()];
+        let peer: IpAddr = "10.0.0.3".parse().unwrap();
+
+        // Disabled: the direct peer wins even though it is trusted.
+        assert_eq!(effective_client(peer, &headers, &proxies, false), peer);
+        // Enabled: skip trusted hops from the right, return the real client.
+        assert_eq!(
+            effective_client(peer, &headers, &proxies, true),
+            "203.0.113.9".parse::<IpAddr>().unwrap()
+        );
+        // A non-trusted direct peer cannot inject forwarded headers.
+        let direct: IpAddr = "198.51.100.7".parse().unwrap();
+        assert_eq!(effective_client(direct, &headers, &proxies, true), direct);
+    }
+
+    #[test]
+    fn log_escaping_and_allow_header_are_stable() {
+        assert_eq!(escape_log("a\"b\\c"), "a\\\"b\\\\c");
+        let mut methods = HashMap::new();
+        methods.insert(Method::GET, 0);
+        methods.insert(Method::POST, 1);
+        assert_eq!(allow_header(&methods), "GET, HEAD, OPTIONS, POST");
     }
 }

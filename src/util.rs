@@ -228,3 +228,15 @@ pub fn headers_to_vec(headers: Option<&Bound<'_, PyAny>>) -> PyResult<Vec<(Strin
     }
     Ok(result)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::write_json_string;
+
+    #[test]
+    fn json_strings_escape_control_characters_and_quotes() {
+        let mut out = Vec::new();
+        write_json_string(&mut out, "a\"b\\c\n\t\u{1}");
+        assert_eq!(out, b"\"a\\\"b\\\\c\\n\\t\\u0001\"");
+    }
+}

@@ -18,8 +18,9 @@ import importlib
 import re
 import types
 import uuid
-from dataclasses import dataclass, field
-from typing import Any, Iterable, Iterator
+from collections.abc import Iterable, Iterator
+from dataclasses import dataclass, field, replace
+from typing import Any
 
 _CONVERTER_RE = re.compile(
     r"<(?:(?P<converter>[a-zA-Z_][a-zA-Z0-9_]*):)?"
@@ -287,14 +288,33 @@ def flatten(patterns: Iterable[Any], prefix: str = "") -> Iterator[ResolvedPatte
 _NAMED_PATTERNS: dict[str, ResolvedPattern] = {}
 
 
-def register_patterns(patterns: Iterable[Any]) -> list[ResolvedPattern]:
-    """Flatten ``patterns`` and remember named routes for ``reverse()``."""
+def register_patterns(
+    patterns: Iterable[Any],
+    registry: dict[str, ResolvedPattern] | None = None,
+) -> list[ResolvedPattern]:
+    """Flatten ``patterns`` and remember named routes for ``reverse()``.
+
+    Pass ``registry`` to collect names in an application-scoped mapping instead
+    of the process-global one.  The global mapping is still updated so the
+    module-level ``reverse()`` helper keeps working.
+    """
     resolved = list(flatten(patterns))
-    for pattern in resolved:
+    target = registry if registry is not None else _NAMED_PATTERNS
+    if registry is not None and registry is not _NAMED_PATTERNS:
+        # An application resolver is rebuilt from scratch, so stale names from
+        # a previous configuration cannot leak into reverse().
+        registry.clear()
+
+    def remember(store: dict[str, ResolvedPattern], pattern: ResolvedPattern) -> None:
         if pattern.full_name:
-            _NAMED_PATTERNS[pattern.full_name] = pattern
-        if pattern.name and pattern.name not in _NAMED_PATTERNS:
-            _NAMED_PATTERNS[pattern.name] = pattern
+            store[pattern.full_name] = pattern
+        if pattern.name and pattern.name not in store:
+            store[pattern.name] = pattern
+
+    for pattern in resolved:
+        remember(target, pattern)
+        if target is not _NAMED_PATTERNS:
+            remember(_NAMED_PATTERNS, pattern)
     return resolved
 
 
@@ -306,10 +326,12 @@ def reverse(
     viewname: str,
     args: Iterable[Any] | None = None,
     kwargs: dict[str, Any] | None = None,
+    registry: dict[str, ResolvedPattern] | None = None,
 ) -> str:
     """Build a URL for a named pattern."""
+    patterns = registry if registry is not None else _NAMED_PATTERNS
     try:
-        pattern = _NAMED_PATTERNS[viewname]
+        pattern = patterns[viewname]
     except KeyError as error:
         raise NoReverseMatch(f"no URL pattern named {viewname!r}") from error
 
@@ -364,13 +386,13 @@ def resolve(path: str, patterns: Iterable[Any] | None = None) -> ResolvedPattern
     for pattern in flatten(source):
         match = _path_regex(pattern.django_path).match(path)
         if match:
-            pattern.kwargs.update(
-                {
-                    name: pattern.converters.get(name, get_converter("str")).to_python(value)
-                    for name, value in match.groupdict().items()
-                }
-            )
-            return pattern
+            captured = {
+                name: pattern.converters.get(name, get_converter("str")).to_python(value)
+                for name, value in match.groupdict().items()
+            }
+            # Return a copy so repeated resolve() calls never accumulate state
+            # on the pattern object.
+            return replace(pattern, kwargs={**pattern.kwargs, **captured})
     return None
 
 

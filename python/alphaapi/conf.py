@@ -23,6 +23,22 @@ import os
 from typing import Any
 
 
+def package_version() -> str:
+    """Return the installed distribution version (or the source fallback)."""
+    try:
+        from importlib.metadata import version
+
+        return version("alphaapi")
+    except Exception:  # pragma: no cover - only hit for source checkouts
+        return "0.1.0"
+
+
+def load_module_settings(module_path: str) -> dict[str, Any]:
+    """Import ``module_path`` and return its uppercase attributes."""
+    module = importlib.import_module(module_path)
+    return {key: getattr(module, key) for key in dir(module) if key.isupper()}
+
+
 DEFAULTS: dict[str, Any] = {
     "DEBUG": False,
     "SECRET_KEY": "",
@@ -32,10 +48,11 @@ DEFAULTS: dict[str, Any] = {
     "ROOT_URLCONF": None,
     "DEFAULT_CHARSET": "utf-8",
     "MAX_BODY_SIZE": 16 * 1024 * 1024,
+    "MAX_UPLOAD_SIZE": 16 * 1024 * 1024,
     "ACCESS_LOG": False,
     "ACCESS_LOG_JSON": False,
     "TITLE": "AlphaAPI",
-    "VERSION": "0.1.0",
+    "VERSION": package_version(),
     # Proxy / security
     "TRUST_PROXY_HEADERS": False,
     "TRUSTED_PROXIES": [],
@@ -59,7 +76,6 @@ DEFAULTS: dict[str, Any] = {
     "STATIC_URL": "/static/",
     "STATIC_ROOT": None,
     "TEMPLATES_DIR": None,
-    "APPEND_SLASH": False,
     # OpenAPI
     "ENABLE_OPENAPI": False,
     "OPENAPI_URL": "/openapi.json",
@@ -150,7 +166,60 @@ class Settings:
             object.__setattr__(self, "_loaded", True)
 
 
+class ScopedSettings:
+    """A settings view with per-application overrides.
+
+    Reads fall through to the process-wide :data:`settings` object, while
+    writes are kept local to this view.  This lets several ``Application``
+    instances coexist without one silently mutating another's configuration:
+    values changed later on the global object are still visible unless this
+    application explicitly overrode them.
+    """
+
+    def __init__(
+        self, base: Settings | None = None, overrides: dict[str, Any] | None = None
+    ) -> None:
+        object.__setattr__(self, "_base", base if base is not None else settings)
+        object.__setattr__(self, "_overrides", dict(overrides or {}))
+
+    def __getattr__(self, name: str) -> Any:
+        overrides = object.__getattribute__(self, "_overrides")
+        if name in overrides:
+            return overrides[name]
+        return getattr(object.__getattribute__(self, "_base"), name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name.startswith("_"):
+            object.__setattr__(self, name, value)
+        else:
+            self._overrides[name] = value
+
+    def __dir__(self) -> list[str]:
+        return sorted(set(dir(self._base)) | set(self._overrides))
+
+    def configure(self, **options: Any) -> None:
+        for key, value in options.items():
+            if not key.isupper():
+                raise TypeError(f"setting names must be uppercase, got {key!r}")
+            self._overrides[key] = value
+
+    def configure_from_module(self, module_path: str) -> None:
+        self._overrides.update(load_module_settings(module_path))
+
+    @property
+    def overrides(self) -> dict[str, Any]:
+        """A copy of the values that differ from the global settings."""
+        return dict(self._overrides)
+
+
 settings = Settings()
 
 
-__all__ = ["settings", "Settings", "DEFAULTS"]
+__all__ = [
+    "settings",
+    "Settings",
+    "ScopedSettings",
+    "DEFAULTS",
+    "load_module_settings",
+    "package_version",
+]

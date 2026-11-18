@@ -6,12 +6,13 @@ middleware.
 """
 from __future__ import annotations
 
+from collections.abc import Iterable
 from http.cookies import SimpleCookie
-from typing import Any, Iterable
+from typing import Any
 from urllib.parse import parse_qsl, urljoin
 
 from .._core import Request as _RawRequest
-from .multipart import UploadedFile, parse_multipart
+from .multipart import parse_multipart
 
 
 class QueryDict(dict):
@@ -90,22 +91,79 @@ class HttpRequest:
         self.client = raw.client
         self.headers = raw.headers
         self.content_type = self.headers.get("content-type", "")
-        self.META = {
-            "REQUEST_METHOD": self.method,
-            "PATH_INFO": self.path,
-            "QUERY_STRING": self.query_string,
-            "REMOTE_ADDR": self.client,
-            "CONTENT_TYPE": self.content_type,
-            "CONTENT_LENGTH": self.headers.get("content-length", ""),
-            "HTTP_HOST": self.headers.get("host", ""),
-        }
-        for name, value in self.headers.items():
-            key = "HTTP_" + name.upper().replace("-", "_")
-            if key not in self.META:
-                self.META[key] = value
-        self.GET = QueryDict(raw.query_params)
-        self.POST, self.FILES = self._parse_form()
-        self.COOKIES = _parse_cookies(self.headers.get("cookie", ""))
+        self._get_cache: QueryDict | None = None
+        self._meta_cache: dict[str, Any] | None = None
+        self._cookie_cache: dict[str, str] | None = None
+        self._post_cache: QueryDict | None = None
+        self._files_cache: dict[str, Any] | None = None
+
+    @property
+    def META(self) -> dict[str, Any]:
+        """CGI-style metadata, built on first access."""
+        if self._meta_cache is None:
+            meta: dict[str, Any] = {
+                "REQUEST_METHOD": self.method,
+                "PATH_INFO": self.path,
+                "QUERY_STRING": self.query_string,
+                "REMOTE_ADDR": self.client,
+                "CONTENT_TYPE": self.content_type,
+                "CONTENT_LENGTH": self.headers.get("content-length", ""),
+                "HTTP_HOST": self.headers.get("host", ""),
+            }
+            for name, value in self.headers.items():
+                key = "HTTP_" + name.upper().replace("-", "_")
+                if key not in meta:
+                    meta[key] = value
+            self._meta_cache = meta
+        return self._meta_cache
+
+    @META.setter
+    def META(self, value: dict[str, Any]) -> None:
+        self._meta_cache = value
+
+    @property
+    def GET(self) -> QueryDict:
+        if self._get_cache is None:
+            self._get_cache = QueryDict(self._raw.query_params)
+        return self._get_cache
+
+    @GET.setter
+    def GET(self, value: Any) -> None:
+        self._get_cache = value
+
+    @property
+    def COOKIES(self) -> dict[str, str]:
+        if self._cookie_cache is None:
+            self._cookie_cache = _parse_cookies(self.headers.get("cookie", ""))
+        return self._cookie_cache
+
+    @COOKIES.setter
+    def COOKIES(self, value: dict[str, str]) -> None:
+        self._cookie_cache = value
+
+    def _ensure_form(self) -> None:
+        if self._post_cache is None:
+            self._post_cache, self._files_cache = self._parse_form()
+
+    @property
+    def POST(self) -> QueryDict:
+        self._ensure_form()
+        assert self._post_cache is not None
+        return self._post_cache
+
+    @POST.setter
+    def POST(self, value: Any) -> None:
+        self._post_cache = value
+
+    @property
+    def FILES(self) -> dict[str, Any]:
+        self._ensure_form()
+        assert self._files_cache is not None
+        return self._files_cache
+
+    @FILES.setter
+    def FILES(self, value: dict[str, Any]) -> None:
+        self._files_cache = value
 
     def _parse_form(self) -> tuple[QueryDict, dict[str, Any]]:
         content_type = self.headers.get("content-type", "").split(";", 1)[0].strip().lower()
@@ -117,8 +175,12 @@ class HttpRequest:
             return QueryDict(parse_qsl(text, keep_blank_values=True)), {}
 
         if content_type == "multipart/form-data":
+            from ..conf import settings
+
             fields, files = parse_multipart(
-                self._raw.body, self.headers.get("content-type", "")
+                self._raw.body,
+                self.headers.get("content-type", ""),
+                max_file_size=getattr(settings, "MAX_UPLOAD_SIZE", None),
             )
             post = QueryDict(fields)
             mapped: dict[str, Any] = {

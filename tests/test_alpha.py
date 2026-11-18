@@ -3,17 +3,14 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
-from dataclasses import dataclass
 from uuid import UUID
 
 import pytest
-
 from alphaapi import (
     Application,
-    HTTPException,
     Http404,
+    HTTPException,
     HttpResponse,
-    HttpResponseNotFound,
     HttpResponseRedirect,
     JsonResponse,
     MiddlewareMixin,

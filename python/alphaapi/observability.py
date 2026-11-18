@@ -26,6 +26,15 @@ class RequestIdMiddleware:
         return response
 
 
+def _escape_label(value: Any) -> str:
+    return (
+        str(value)
+        .replace("\\", "\\\\")
+        .replace("\n", "\\n")
+        .replace('"', '\\"')
+    )
+
+
 class Metrics:
     """A small, dependency-free Prometheus-compatible metric registry."""
 
@@ -62,7 +71,8 @@ class Metrics:
         for (method, route, status), value in sorted(requests.items()):
             lines.append(
                 "alphaapi_requests_total"
-                f'{{method="{method}",route="{route}",status="{status}"}} {value}'
+                f'{{method="{_escape_label(method)}",route="{_escape_label(route)}",'
+                f'status="{_escape_label(status)}"}} {value}'
             )
 
         lines.extend(
@@ -73,7 +83,10 @@ class Metrics:
         )
         for key in sorted(duration_sum):
             method, route = key
-            labels = f'method="{method}",route="{route}"'
+            labels = (
+                f'method="{_escape_label(method)}",'
+                f'route="{_escape_label(route)}"'
+            )
             lines.append(f"alphaapi_request_duration_seconds_sum{{{labels}}} {duration_sum[key]:.9f}")
             lines.append(
                 f"alphaapi_request_duration_seconds_count{{{labels}}} {duration_count[key]}"

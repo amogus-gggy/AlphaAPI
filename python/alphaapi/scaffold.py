@@ -5,7 +5,6 @@ import re
 import secrets
 from pathlib import Path
 
-
 _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 

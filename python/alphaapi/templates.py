@@ -1,8 +1,9 @@
 """Optional Jinja2 template integration."""
 from __future__ import annotations
 
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 from .conf import settings
 from .http import HttpResponse

@@ -26,6 +26,11 @@ from typing import Any, get_args, get_origin
 
 _MISSING = object()
 
+# ``types.UnionType`` only exists on Python 3.10+; keep the 3.9 fallback.
+_UNION_ORIGINS = (typing.Union,)
+if hasattr(types, "UnionType"):
+    _UNION_ORIGINS = _UNION_ORIGINS + (types.UnionType,)
+
 
 @dataclass(frozen=True)
 class Param:
@@ -112,7 +117,7 @@ def _unwrap_annotation(annotation: Any) -> Any:
         args = get_args(annotation)
         return _unwrap_annotation(args[0]) if args else annotation
 
-    if origin in (typing.Union, types.UnionType):
+    if origin in _UNION_ORIGINS:
         args = [arg for arg in get_args(annotation) if arg is not type(None)]
         if len(args) == 1:
             return _unwrap_annotation(args[0])
@@ -154,10 +159,10 @@ def infer_type(annotation: Any, kind: str) -> tuple[str, Any]:
         tuple,
         set,
         frozenset,
-        typing.List,
-        typing.Tuple,
-        typing.Set,
-        typing.FrozenSet,
+        typing.List,  # noqa: UP006
+        typing.Tuple,  # noqa: UP006
+        typing.Set,  # noqa: UP006
+        typing.FrozenSet,  # noqa: UP006
     }
     if origin in sequence_origins or annotation in sequence_origins:
         if not args or _unwrap_annotation(args[0]) is str:
@@ -216,6 +221,18 @@ def wants_request(view: Any) -> bool:
     if isinstance(first.default, Param):
         return False
     return first.annotation is inspect.Parameter.empty
+
+
+def positional_only_names(view: Any) -> set[str]:
+    """Return parameter names declared positional-only (``def f(x, /)``)."""
+    signature = _signature(view)
+    if signature is None:
+        return set()
+    return {
+        name
+        for name, parameter in signature.parameters.items()
+        if parameter.kind is inspect.Parameter.POSITIONAL_ONLY
+    }
 
 
 def build_param_specs(
@@ -302,7 +319,7 @@ def build_param_specs(
                 "required": bool(required),
                 "default": None if default is _MISSING else default,
                 "model": model,
-                "positional": False,
+                "positional": parameter.kind is inspect.Parameter.POSITIONAL_ONLY,
             }
         )
     return specs
@@ -316,5 +333,6 @@ __all__ = [
     "Path",
     "infer_type",
     "build_param_specs",
+    "positional_only_names",
     "wants_request",
 ]

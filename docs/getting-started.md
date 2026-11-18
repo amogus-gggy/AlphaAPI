@@ -140,7 +140,7 @@ async def search(
     request,
     q: str,
     limit: int = 10,
-    tags: list[str] = Query(default=[]),
+    tags: list[str] = Query(default=None),
     x_api_key: str = Header(...),
 ):
     return JsonResponse({"q": q, "limit": limit, "tags": tags})

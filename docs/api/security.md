@@ -66,9 +66,10 @@ TRUSTED_PROXIES = ["127.0.0.1", "10.1.2.3"]
 SECURE_PROXY_SSL_HEADER = "x-forwarded-proto"
 ```
 
-With `TRUST_PROXY_HEADERS` enabled, `request.client` uses the first
-`X-Forwarded-For` value when the direct peer matches an entry in
-`TRUSTED_PROXIES` (exact IPs, or `"*"`). `request.scheme`,
+With `TRUST_PROXY_HEADERS` enabled, `request.client` uses `X-Forwarded-For`
+when the direct peer matches an entry in `TRUSTED_PROXIES` (exact IPs, or
+`"*"`). The rightmost untrusted hop is used, so an upstream that appends to an
+existing header cannot spoof the client address. `request.scheme`,
 `request.is_secure()`, and `request.build_absolute_uri()` use
 `X-Forwarded-Proto`. Leave `TRUST_PROXY_HEADERS = False` when clients can
 connect directly, otherwise they can spoof these headers.

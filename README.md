@@ -272,7 +272,7 @@ async def search(
     request,
     q: str,
     limit: int = 10,
-    tags: list[str] = Query(default=[]),
+    tags: list[str] = Query(default=None),
     x_api_key: str = Header(...),
 ):
     return JsonResponse({"q": q, "limit": limit, "tags": tags})
@@ -538,9 +538,11 @@ AlphaAPI                      9,363       0.534s        0
 FastAPI + uvicorn               415      12.042s        0
 ```
 
-Absolute numbers vary with CPU frequency scaling; the relative gap has stayed
-around 12–22x. Use `--python-load` to fall back to the dependency-free Python
-load client.
+Absolute numbers vary with CPU frequency scaling. The headline gap is not an
+apples-to-apples comparison: AlphaAPI ran its multi-threaded Rust server while
+uvicorn used a single worker and synchronous FastAPI handlers. Check the runner
+and worker flags before quoting a ratio. Use `--python-load` to fall back to the
+dependency-free Python load client.
 
 ## Documentation
 
@@ -585,9 +587,9 @@ streaming responses. See [testing](docs/api/testing.md).
 
 The Python layer resolves URLconfs at startup and hands a compact route
 specification to the Rust core. At request time the Rust server parses and routes
-the request, converts typed path converters, builds the Python request object,
-and calls the view. Response serialization for dict/list values also happens in
-Rust.
+the request, converts typed path converters, builds the Python request object
+only when the view (or middleware) needs one, and calls the view. Response
+serialization for dict/list values also happens in Rust.
 
 ### Hot-path design
 
@@ -619,6 +621,8 @@ Rust.
   a reverse proxy if you need HTTPS.
 - Sync views should stay short. Long CPU-bound work should move to async code or
   another process.
+- `MAX_CONCURRENT_REQUESTS` is admission control: requests over the limit get an
+  immediate `503` rather than waiting in a queue.
 - Jinja2 template support is optional (`pip install "alphaapi[templates]"`).
 
 ## License

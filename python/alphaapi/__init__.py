@@ -7,8 +7,8 @@ an async-first execution model and a Rust HTTP core.  It intentionally ships
 """
 
 from ._core import Request, Response
-from .apps import AppConfig, AppRegistry, apps
 from .app import Application, import_string
+from .apps import AppConfig, AppRegistry, apps
 from .auth import (
     AnonymousUser,
     AuthenticationMiddleware,
@@ -17,12 +17,13 @@ from .auth import (
     logout,
 )
 from .conf import Settings, settings
+from .conf import package_version as _package_version
 from .cors import CorsMiddleware
 from .csrf import CsrfMiddleware, get_token
 from .exceptions import (
     BadRequest,
-    HTTPException,
     Http404,
+    HTTPException,
     PermissionDenied,
     RequestValidationError,
 )
@@ -62,7 +63,8 @@ from .observability import (
 from .params import Body, Header, Param, Path, Query
 from .security import SecurityMiddleware
 from .sessions import MemorySessionStore, Session, SessionMiddleware, SessionStore
-from .signed_cookies import dumps as dumps_signed, loads as loads_signed
+from .signed_cookies import dumps as dumps_signed
+from .signed_cookies import loads as loads_signed
 from .staticfiles import StaticFiles, static
 from .templates import TemplateEngine, TemplateResponse, render
 from .testing import Client, ClientResponse
@@ -79,7 +81,7 @@ from .urls import (
 )
 from .views import RedirectView, View
 
-__version__ = "0.1.0"
+__version__ = _package_version()
 
 __all__ = [
     # application / configuration
