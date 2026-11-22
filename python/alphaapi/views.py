@@ -56,11 +56,11 @@ class View:
     async def dispatch(self, request: Any, *args: Any, **kwargs: Any) -> Any:
         method = request.method.lower()
         if method == "head":
-            handler = getattr(self, "head", None) or getattr(
-                self, "get", self.http_method_not_allowed
-            )
+            handler = getattr(self, "head", None) or getattr(self, "get", None)
         else:
-            handler = getattr(self, method, self.http_method_not_allowed)
+            handler = getattr(self, method, None)
+        if handler is None:
+            handler = self.http_method_not_allowed
         return await _await_if_needed(handler(request, *args, **kwargs))
 
     def http_method_not_allowed(self, request: Any, *args: Any, **kwargs: Any) -> Any:

@@ -28,11 +28,14 @@ class AppConfig:
                 self.path = Path(module.__file__).resolve().parent
             elif self.name:
                 try:
-                    self.path = Path(
-                        importlib.import_module(self.name).__file__
-                    ).resolve().parent
-                except (ImportError, TypeError):
-                    self.path = None
+                    # Built-in modules (e.g. ``math``) have no ``__file__``.
+                    module_file = getattr(
+                        importlib.import_module(self.name), "__file__", None
+                    )
+                except ImportError:
+                    module_file = None
+                if module_file:
+                    self.path = Path(module_file).resolve().parent
 
     @property
     def label(self) -> str:

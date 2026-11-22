@@ -99,10 +99,12 @@ def parse_multipart(
         if part.get_content_disposition() != "form-data":
             continue
         name = part.get_param("name", header="content-disposition")
-        if not name:
+        if not isinstance(name, str) or not name:
             continue
         filename = part.get_filename()
-        payload = part.get_payload(decode=True) or b""
+        payload = part.get_payload(decode=True)
+        if not isinstance(payload, bytes):
+            payload = b""
         charset = part.get_content_charset() or "utf-8"
 
         if filename is not None:

@@ -103,6 +103,10 @@ def _free_port() -> int:
         return sock.getsockname()[1]
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="Popen.send_signal(SIGINT) is unsupported on Windows",
+)
 def test_generated_manage_py_exits_on_sigint(tmp_path):
     target = tmp_path / "site"
     startproject("demo", target)

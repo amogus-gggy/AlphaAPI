@@ -501,23 +501,26 @@ class Application:
             return
         handlers: list[tuple[type[BaseException], Callable[..., Any]]] = []
         for exc_type, handler in self._exception_handlers.items():
-            if is_async_callable(handler):
-
-                async def wrapped(
-                    raw_request: Any, exception: Any, _handler: Any = handler
-                ) -> Any:
-                    return await _handler(HttpRequest(raw_request), exception)
-
-            else:
-
-                def wrapped(raw_request: Any, exception: Any, _handler: Any = handler) -> Any:
-                    return _handler(HttpRequest(raw_request), exception)
-
-            handlers.append((exc_type, wrapped))
+            handlers.append((exc_type, self._wrap_exception_handler(handler)))
         self._core.set_http_exception_type(HTTPException)
         for exc_type, wrapped in handlers:
             self._core.add_exception_handler(exc_type, wrapped)
         self._handlers_registered = True
+
+    @staticmethod
+    def _wrap_exception_handler(handler: Callable[..., Any]) -> Callable[..., Any]:
+        """Adapt a user exception handler to the Rust ``(request, exception)`` call."""
+        if is_async_callable(handler):
+
+            async def async_wrapped(raw_request: Any, exception: Any) -> Any:
+                return await handler(HttpRequest(raw_request), exception)
+
+            return async_wrapped
+
+        def wrapped(raw_request: Any, exception: Any) -> Any:
+            return handler(HttpRequest(raw_request), exception)
+
+        return wrapped
 
     # -- running ------------------------------------------------------------
 

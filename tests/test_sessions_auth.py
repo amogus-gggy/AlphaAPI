@@ -108,6 +108,9 @@ def test_session_cookie_secure_attribute(settings_override):
         assert "Secure" in response.headers["set-cookie"]
 
 
+# This test deliberately exercises the empty-secret path; the warning it
+# triggers is expected behaviour, so acknowledge it here.
+@pytest.mark.filterwarnings("ignore:SessionMiddleware is enabled but SECRET_KEY is empty")
 def test_session_without_secret_key(settings_override):
     settings_override(SECRET_KEY="")
     with Client(_build()) as client:
@@ -116,7 +119,9 @@ def test_session_without_secret_key(settings_override):
 
 
 def test_authentication_without_resolver(settings_override):
-    settings_override(AUTH_USER_RESOLVER=None)
+    # Sessions are exercised elsewhere; give the middleware a secret so the
+    # only behaviour under test is the missing resolver.
+    settings_override(AUTH_USER_RESOLVER=None, SECRET_KEY="sessions-secret")
     with Client(_build()) as client:
         data = _json(client.get("/whoami/"))
         assert data["anonymous"] is True

@@ -27,7 +27,7 @@ from typing import Any, get_args, get_origin
 _MISSING = object()
 
 # ``types.UnionType`` only exists on Python 3.10+; keep the 3.9 fallback.
-_UNION_ORIGINS = (typing.Union,)
+_UNION_ORIGINS: tuple[Any, ...] = (typing.Union,)
 if hasattr(types, "UnionType"):
     _UNION_ORIGINS = _UNION_ORIGINS + (types.UnionType,)
 
@@ -118,9 +118,9 @@ def _unwrap_annotation(annotation: Any) -> Any:
         return _unwrap_annotation(args[0]) if args else annotation
 
     if origin in _UNION_ORIGINS:
-        args = [arg for arg in get_args(annotation) if arg is not type(None)]
-        if len(args) == 1:
-            return _unwrap_annotation(args[0])
+        values = [arg for arg in get_args(annotation) if arg is not type(None)]
+        if len(values) == 1:
+            return _unwrap_annotation(values[0])
     return annotation
 
 

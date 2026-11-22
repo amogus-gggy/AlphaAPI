@@ -75,7 +75,7 @@ class Headers(MutableMapping[str, str]):
     # Django-compatible alias.
     getlist = get_all
 
-    def items(self, multi: bool = False) -> Any:  # type: ignore[override]
+    def items(self, multi: bool = False) -> Any:
         if multi:
             return list(self._response.header_items())
         return [(name, self[name]) for name in self]
@@ -118,7 +118,9 @@ class HttpResponse(Response):
         self.media_type = content_type
         self.body = b"" if content is None else content
 
-    @property
+    # The Rust base declares ``headers`` as ``dict[str, str]``; the subclass
+    # intentionally exposes the multi-value ``Headers`` view instead.
+    @property  # type: ignore[override]
     def headers(self) -> Headers:
         view = self.__dict__.get("_headers_view")
         if view is None:
@@ -336,7 +338,7 @@ class FileResponse(StreamingHttpResponse):
                     status = 416
                     no_body = True
                     self._length = 0
-                elif parsed is not None:
+                elif isinstance(parsed, tuple):
                     self._start, end = parsed
                     self._length = end - self._start + 1
                     status = 206
@@ -466,10 +468,10 @@ class SseResponse(StreamingHttpResponse):
         cls, source: Iterable[Any] | AsyncIterable[Any]
     ) -> Any:
         if hasattr(source, "__aiter__"):
-            async def generator():
+            async def async_generator():
                 async for item in source:
                     yield cls._format_chunk(item)
-            return generator()
+            return async_generator()
 
         def generator():
             for item in source:
