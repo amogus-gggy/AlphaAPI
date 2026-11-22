@@ -1,16 +1,8 @@
 name: docs
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - "docs/**"
-      - "mkdocs.yml"
-      - "python/alphaapi/**"
-      - ".github/workflows/docs.yml"
   release:
     types: [published]
-  workflow_dispatch:
 
 permissions:
   contents: read
