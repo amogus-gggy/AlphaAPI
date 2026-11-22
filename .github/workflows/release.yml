@@ -1,0 +1,24 @@
+name: release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  pypi:
+    name: Publish to PyPI
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build sdist and wheels
+        run: pip install -q "maturin>=1.7,<2.0" && maturin sdist --out dist && maturin build --release --out dist
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
