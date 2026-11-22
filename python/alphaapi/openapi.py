@@ -159,7 +159,7 @@ def build_openapi(app: Any) -> dict[str, Any]:
         "openapi": "3.1.0",
         "info": {
             "title": title,
-            "version": str(getattr(app, "version", "0.1.0")),
+            "version": str(getattr(app, "version", "0.2.0b")),
         },
         "paths": paths,
         "components": {"schemas": components},

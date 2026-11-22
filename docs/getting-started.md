@@ -5,27 +5,23 @@ This guide takes you from a clean checkout to a running AlphaAPI project.
 ## Requirements
 
 - Python 3.9 or newer
-- A Rust toolchain (`rustup`) for building the extension
-- `maturin`
+- A Rust toolchain (`rustup`) for building the extension from source
 
-## Install from source
+## Install
+
+```bash
+python -m venv .venv
+. .venv/bin/activate
+pip install alphaapi
+```
+
+To develop from source, clone the repository and install the editable package
+(requires a Rust toolchain):
 
 ```bash
 git clone https://github.com/amogus-gggy/AlphaAPI.git
 cd AlphaAPI
-
-python -m venv .venv
-. .venv/bin/activate
-pip install maturin
-
-# Development build (fast rebuilds)
-maturin develop
-```
-
-For production or benchmarking, build with optimizations:
-
-```bash
-maturin develop --release
+pip install -e .
 ```
 
 ## Scaffold a project

@@ -18,13 +18,12 @@ optional Jinja2 templates, a real-server test client, and CLI inspection tools.
 
 > Status: early preview. The public API is intentionally small and may evolve.
 
-## Install (from source)
+## Install
 
 ```bash
 python -m venv .venv
 . .venv/bin/activate
-pip install maturin
-maturin develop --release
+pip install alphaapi
 ```
 
 ## Quick start
@@ -213,7 +212,7 @@ full list):
 | `TEMPLATES_DIR`   | `None`         |
 | `ENABLE_OPENAPI`  | `False`        |
 | `TITLE`           | `"AlphaAPI"`   |
-| `VERSION`         | `"0.1.0"`      |
+| `VERSION`         | `"0.2.0b"`     |
 
 ## URLs
 

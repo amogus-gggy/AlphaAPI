@@ -30,7 +30,7 @@ def package_version() -> str:
 
         return version("alphaapi")
     except Exception:  # pragma: no cover - only hit for source checkouts
-        return "0.1.0"
+        return "0.2.0b"
 
 
 def load_module_settings(module_path: str) -> dict[str, Any]:

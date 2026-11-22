@@ -68,7 +68,7 @@ ROOT_URLCONF = "{name}.urls"
 INSTALLED_APPS: list[str] = []
 MIDDLEWARE: list[str] = []
 TITLE = "{name}"
-VERSION = "0.1.0"
+VERSION = "0.2.0b"
 ACCESS_LOG = True
 '''
 

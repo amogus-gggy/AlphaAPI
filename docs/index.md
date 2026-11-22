@@ -61,8 +61,7 @@ async-first execution model and an HTTP core written in Rust.
 ```bash
 python -m venv .venv
 . .venv/bin/activate
-pip install maturin
-maturin develop --release
+pip install alphaapi
 ```
 
 Create `main.py`:

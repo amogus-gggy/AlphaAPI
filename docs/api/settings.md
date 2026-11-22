@@ -50,7 +50,7 @@ settings.configure(DEBUG=True, TITLE="Scratch")
 | `ACCESS_LOG` | `False` |
 | `ACCESS_LOG_JSON` | `False` |
 | `TITLE` | `"AlphaAPI"` |
-| `VERSION` | `"0.1.0"` |
+| `VERSION` | `"0.2.0b"` |
 
 ### Proxy and security
 
